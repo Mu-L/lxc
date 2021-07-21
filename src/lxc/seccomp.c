@@ -1310,6 +1310,7 @@ void lxc_seccomp_free(struct lxc_seccomp *seccomp)
 	seccomp_notify_free(seccomp->notifier.req_buf, seccomp->notifier.rsp_buf);
 	seccomp->notifier.req_buf = NULL;
 	seccomp->notifier.rsp_buf = NULL;
+	free_disarm(seccomp->notifier.cookie);
 #endif
 }
 
@@ -1512,7 +1513,7 @@ retry:
 	}
 
 	if (resp->id != req_id) {
-		ERROR("Proxy returned response with illegal id(%llu) != id(%llu)",
+		ERROR("Proxy returned response with invalid id(%llu) != id(%llu)",
 		      (long long unsigned int)resp->id, (long long unsigned int)req_id);
 		resp->id = req_id;
 		seccomp_notify_default_answer(fd, req, resp, hdlr);
@@ -1527,7 +1528,7 @@ retry:
 	}
 
 	if (resp->id != req_id) {
-		ERROR("Proxy returned response with illegal id(%llu) != id(%llu)",
+		ERROR("Proxy returned response with invalid id(%llu) != id(%llu)",
 		      (long long unsigned int)resp->id, (long long unsigned int)req_id);
 		resp->id = req_id;
 	}
@@ -1560,6 +1561,7 @@ void seccomp_conf_init(struct lxc_conf *conf)
 	       sizeof(conf->seccomp.notifier.proxy_addr));
 	conf->seccomp.notifier.req_buf = NULL;
 	conf->seccomp.notifier.rsp_buf = NULL;
+	conf->seccomp.notifier.cookie = NULL;
 #endif
 }
 

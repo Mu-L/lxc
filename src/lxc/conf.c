@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <pwd.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,7 @@
 #include "start.h"
 #include "storage/storage.h"
 #include "storage/overlay.h"
+#include "sync.h"
 #include "syscall_wrappers.h"
 #include "terminal.h"
 #include "utils.h"
@@ -80,10 +82,6 @@
 #include <sys/capability.h>
 #endif
 
-#if HAVE_SYS_PERSONALITY_H
-#include <sys/personality.h>
-#endif
-
 #ifndef HAVE_STRLCAT
 #include "include/strlcat.h"
 #endif
@@ -100,6 +98,10 @@
 
 #ifndef HAVE_STRLCPY
 #include "include/strlcpy.h"
+#endif
+
+#ifndef HAVE_STRCHRNUL
+#include "include/strchrnul.h"
 #endif
 
 lxc_log_define(conf, lxc);
@@ -126,7 +128,9 @@ char *lxchook_names[NUM_LXC_HOOKS] = {
 struct mount_opt {
 	char *name;
 	int clear;
-	int flag;
+	bool recursive;
+	__u64 flag;
+	int legacy_flag;
 };
 
 struct caps_opt {
@@ -140,45 +144,48 @@ struct limit_opt {
 };
 
 static struct mount_opt mount_opt[] = {
-	{ "async",         1, MS_SYNCHRONOUS },
-	{ "atime",         1, MS_NOATIME     },
-	{ "bind",          0, MS_BIND        },
-	{ "defaults",      0, 0              },
-	{ "dev",           1, MS_NODEV       },
-	{ "diratime",      1, MS_NODIRATIME  },
-	{ "dirsync",       0, MS_DIRSYNC     },
-	{ "exec",          1, MS_NOEXEC      },
-	{ "lazytime",	   0, MS_LAZYTIME    },
-	{ "mand",          0, MS_MANDLOCK    },
-	{ "noatime",       0, MS_NOATIME     },
-	{ "nodev",         0, MS_NODEV       },
-	{ "nodiratime",    0, MS_NODIRATIME  },
-	{ "noexec",        0, MS_NOEXEC      },
-	{ "nomand",        1, MS_MANDLOCK    },
-	{ "norelatime",    1, MS_RELATIME    },
-	{ "nostrictatime", 1, MS_STRICTATIME },
-	{ "nosuid",        0, MS_NOSUID      },
-	{ "rbind",         0, MS_BIND|MS_REC },
-	{ "relatime",      0, MS_RELATIME    },
-	{ "remount",       0, MS_REMOUNT     },
-	{ "ro",            0, MS_RDONLY      },
-	{ "rw",            1, MS_RDONLY      },
-	{ "strictatime",   0, MS_STRICTATIME },
-	{ "suid",          1, MS_NOSUID      },
-	{ "sync",          0, MS_SYNCHRONOUS },
-	{ NULL,            0, 0              },
+	{ "atime",         1, false, MOUNT_ATTR_NOATIME,     MS_NOATIME       },
+	{ "dev",           1, false, MOUNT_ATTR_NODEV,       MS_NODEV         },
+	{ "diratime",      1, false, MOUNT_ATTR_NODIRATIME,  MS_NODIRATIME    },
+	{ "exec",          1, false, MOUNT_ATTR_NOEXEC,      MS_NOEXEC        },
+	{ "noatime",       0, false, MOUNT_ATTR_NOATIME,     MS_NOATIME       },
+	{ "nodev",         0, false, MOUNT_ATTR_NODEV,       MS_NODEV         },
+	{ "nodiratime",    0, false, MOUNT_ATTR_NODIRATIME,  MS_NODIRATIME    },
+	{ "noexec",        0, false, MOUNT_ATTR_NOEXEC,      MS_NOEXEC        },
+	{ "norelatime",    1, false, MOUNT_ATTR_RELATIME,    MS_RELATIME      },
+	{ "nostrictatime", 1, false, MOUNT_ATTR_STRICTATIME, MS_STRICTATIME   },
+	{ "nosuid",        0, false, MOUNT_ATTR_NOSUID,      MS_NOSUID        },
+	{ "relatime",      0, false, MOUNT_ATTR_RELATIME,    MS_RELATIME      },
+	{ "ro",            0, false, MOUNT_ATTR_RDONLY,      MS_RDONLY        },
+	{ "rw",            1, false, MOUNT_ATTR_RDONLY,      MS_RDONLY        },
+	{ "strictatime",   0, false, MOUNT_ATTR_STRICTATIME, MS_STRICTATIME   },
+	{ "suid",          1, false, MOUNT_ATTR_NOSUID,      MS_NOSUID        },
+
+	{ "bind",          0, false,  0,                     MS_BIND          },
+	{ "defaults",      0, false,  0,                     0                },
+	{ "rbind",         0, true,   0,                     MS_BIND | MS_REC },
+
+	{ "sync",          0, false, ~0,                     MS_SYNCHRONOUS   },
+	{ "async",         1, false, ~0,		     MS_SYNCHRONOUS   },
+	{ "dirsync",       0, false, ~0,                     MS_DIRSYNC       },
+	{ "lazytime",      0, false, ~0,                     MS_LAZYTIME      },
+	{ "mand",          0, false, ~0,                     MS_MANDLOCK      },
+	{ "nomand",        1, false, ~0,                     MS_MANDLOCK      },
+	{ "remount",       0, false, ~0,                     MS_REMOUNT       },
+
+	{ NULL,            0, false, ~0,                     ~0               },
 };
 
 static struct mount_opt propagation_opt[] = {
-	{ "private",     0, MS_PRIVATE           },
-	{ "shared",      0, MS_SHARED            },
-	{ "slave",       0, MS_SLAVE             },
-	{ "unbindable",  0, MS_UNBINDABLE        },
-	{ "rprivate",    0, MS_PRIVATE|MS_REC    },
-	{ "rshared",     0, MS_SHARED|MS_REC     },
-	{ "rslave",      0, MS_SLAVE|MS_REC      },
-	{ "runbindable", 0, MS_UNBINDABLE|MS_REC },
-	{ NULL,          0, 0                    },
+	{ "private",     0, false, MS_PRIVATE,    MS_PRIVATE             },
+	{ "shared",      0, false, MS_SHARED,     MS_SHARED              },
+	{ "slave",       0, false, MS_SLAVE,      MS_SLAVE               },
+	{ "unbindable",  0, false, MS_UNBINDABLE, MS_UNBINDABLE          },
+	{ "rprivate",    0, true,  MS_PRIVATE,    MS_PRIVATE | MS_REC    },
+	{ "rshared",     0, true,  MS_SHARED,     MS_SHARED | MS_REC     },
+	{ "rslave",      0, true,  MS_SLAVE,      MS_SLAVE | MS_REC      },
+	{ "runbindable", 0, true,  MS_UNBINDABLE, MS_UNBINDABLE | MS_REC },
+	{ NULL,          0, 0                                            },
 };
 
 static struct caps_opt caps_opt[] = {
@@ -479,6 +486,43 @@ int run_script(const char *name, const char *section, const char *script, ...)
 	return run_buffer(buffer);
 }
 
+int lxc_storage_prepare(struct lxc_conf *conf)
+{
+	int ret;
+	struct lxc_rootfs *rootfs = &conf->rootfs;
+
+	if (!rootfs->path) {
+		ret = mount("", "/", NULL, MS_SLAVE | MS_REC, 0);
+		if (ret < 0)
+			return log_error_errno(-1, errno, "Failed to recursively turn root mount tree into dependent mount");
+
+		rootfs->dfd_mnt = open_at(-EBADF, "/", PROTECT_OPATH_DIRECTORY, PROTECT_LOOKUP_ABSOLUTE, 0);
+		if (rootfs->dfd_mnt < 0)
+			return -errno;
+
+		return 0;
+	}
+
+	ret = access(rootfs->mount, F_OK);
+	if (ret != 0)
+		return log_error_errno(-1, errno, "Failed to access to \"%s\". Check it is present",
+				       rootfs->mount);
+
+	rootfs->storage = storage_init(conf);
+	if (!rootfs->storage)
+		return log_error(-1, "Failed to mount rootfs \"%s\" onto \"%s\" with options \"%s\"",
+				 rootfs->path, rootfs->mount,
+				 rootfs->options ? rootfs->options : "(null)");
+
+	return 0;
+}
+
+void lxc_storage_put(struct lxc_conf *conf)
+{
+	storage_put(conf->rootfs.storage);
+	conf->rootfs.storage = NULL;
+}
+
 /* lxc_rootfs_prepare
  * if rootfs is a directory, then open ${rootfs}/.lxc-keep for writing for
  * the duration of the container run, to prevent the container from marking
@@ -486,12 +530,17 @@ int run_script(const char *name, const char *section, const char *script, ...)
  * no name pollution is happens.
  * don't unlink on NFS to avoid random named stale handles.
  */
-int lxc_rootfs_prepare(struct lxc_rootfs *rootfs, bool userns)
+int lxc_rootfs_init(struct lxc_conf *conf, bool userns)
 {
-	__do_close int dfd_path = -EBADF, fd_pin = -EBADF, fd_userns = -EBADF;
+	__do_close int dfd_path = -EBADF, fd_pin = -EBADF;
 	int ret;
 	struct stat st;
 	struct statfs stfs;
+	struct lxc_rootfs *rootfs = &conf->rootfs;
+
+	ret = lxc_storage_prepare(conf);
+	if (ret)
+		return syserror_set(-EINVAL, "Failed to prepare rootfs storage");
 
 	if (!is_empty_string(rootfs->mnt_opts.userns_path)) {
 		if (!rootfs->path)
@@ -499,35 +548,26 @@ int lxc_rootfs_prepare(struct lxc_rootfs *rootfs, bool userns)
 
 		if (rootfs->bdev_type && !strequal(rootfs->bdev_type, "dir"))
 			return syserror_set(-EINVAL, "Idmapped rootfs currently only supports the \"dir\" storage driver");
-
-		fd_userns = open_at(-EBADF, rootfs->mnt_opts.userns_path,
-				    PROTECT_OPEN_WITH_TRAILING_SYMLINKS, 0, 0);
-		if (fd_userns < 0)
-			return syserror("Failed to open user namespace");
 	}
 
-	if (rootfs->path) {
-		if (rootfs->bdev_type &&
-		    (strequal(rootfs->bdev_type, "overlay") ||
-		     strequal(rootfs->bdev_type, "overlayfs")))
+	if (!rootfs->path)
+		return log_trace(0, "Not pinning because container does not have a rootfs");
+
+	if (userns)
+		return log_trace(0, "Not pinning because container runs in user namespace");
+
+	if (rootfs->bdev_type) {
+		if (strequal(rootfs->bdev_type, "overlay") ||
+		    strequal(rootfs->bdev_type, "overlayfs"))
 			return log_trace_errno(0, EINVAL, "Not pinning on stacking filesystem");
 
-		dfd_path = open_at(-EBADF, rootfs->path, PROTECT_OPATH_FILE, 0, 0);
-	} else {
-		dfd_path = open_at(-EBADF, "/", PROTECT_OPATH_FILE, PROTECT_LOOKUP_ABSOLUTE, 0);
+		if (strequal(rootfs->bdev_type, "zfs"))
+			return log_trace_errno(0, EINVAL, "Not pinning on ZFS filesystem");
 	}
+
+	dfd_path = open_at(-EBADF, rootfs->path, PROTECT_OPATH_FILE, 0, 0);
 	if (dfd_path < 0)
 		return syserror("Failed to open \"%s\"", rootfs->path);
-
-	if (!rootfs->path) {
-		TRACE("Not pinning because container does not have a rootfs");
-		goto out;
-	}
-
-	if (userns) {
-		TRACE("Not pinning because container runs in user namespace");
-		goto out;
-	}
 
 	ret = fstat(dfd_path, &st);
 	if (ret < 0)
@@ -540,8 +580,12 @@ int lxc_rootfs_prepare(struct lxc_rootfs *rootfs, bool userns)
 			 PROTECT_OPEN | O_CREAT,
 			 PROTECT_LOOKUP_BENEATH,
 			 S_IWUSR | S_IRUSR);
-	if (fd_pin < 0)
+	if (fd_pin < 0) {
+		if (errno == EROFS) {
+			return log_trace_errno(0, EROFS, "Not pinning on read-only filesystem");
+		}
 		return syserror("Failed to pin rootfs");
+	}
 
 	TRACE("Pinned rootfs %d(.lxc_keep)", fd_pin);
 
@@ -563,7 +607,51 @@ int lxc_rootfs_prepare(struct lxc_rootfs *rootfs, bool userns)
 
 out:
 	rootfs->fd_path_pin = move_fd(fd_pin);
-	rootfs->mnt_opts.userns_fd = move_fd(fd_userns);
+	return 0;
+}
+
+int lxc_rootfs_prepare_parent(struct lxc_handler *handler)
+{
+	__do_close int dfd_idmapped = -EBADF, fd_userns = -EBADF;
+	struct lxc_rootfs *rootfs = &handler->conf->rootfs;
+	struct lxc_storage *storage = rootfs->storage;
+	int ret;
+	const char *path_source;
+
+	if (lxc_list_empty(&handler->conf->id_map))
+		return 0;
+
+	if (is_empty_string(rootfs->mnt_opts.userns_path))
+		return 0;
+
+	if (handler->conf->rootfs_setup)
+		return 0;
+
+	if (rootfs_is_blockdev(handler->conf))
+		return syserror_set(-EOPNOTSUPP, "Idmapped mounts on block-backed storage not yet supported");
+
+	if (!can_use_bind_mounts())
+		return syserror_set(-EOPNOTSUPP, "Kernel does not support the new mount api");
+
+	if (strequal(rootfs->mnt_opts.userns_path, "container"))
+		fd_userns = dup_cloexec(handler->nsfd[LXC_NS_USER]);
+	else
+		fd_userns = open_at(-EBADF, rootfs->mnt_opts.userns_path,
+				    PROTECT_OPEN_WITH_TRAILING_SYMLINKS, 0, 0);
+	if (fd_userns < 0)
+		return syserror("Failed to open user namespace");
+
+	path_source = lxc_storage_get_path(storage->src, storage->type);
+
+	dfd_idmapped = create_detached_idmapped_mount(path_source, fd_userns, true);
+	if (dfd_idmapped < 0)
+		return syserror("Failed to create detached idmapped mount");
+
+	ret = lxc_abstract_unix_send_fds(handler->data_sock[0], &dfd_idmapped, 1, NULL, 0);
+	if (ret < 0)
+		return syserror("Failed to send detached idmapped mount fd");
+
+	TRACE("Created detached idmapped mount %d", dfd_idmapped);
 	return 0;
 }
 
@@ -611,7 +699,7 @@ static int lxc_mount_auto_mounts(struct lxc_handler *handler, int flags)
 		 */
 		{ LXC_AUTO_PROC_MASK, LXC_AUTO_PROC_MIXED, "proc",                                           "%r/proc",                    "proc",  MS_NODEV|MS_NOEXEC|MS_NOSUID,                    NULL, false },
 		/* proc/tty is used as a temporary placeholder for proc/sys/net which we'll move back in a few steps */
-		{ LXC_AUTO_PROC_MASK, LXC_AUTO_PROC_MIXED, "%r/proc/sys/net",                                "%r/proc/tty",                NULL,    MS_BIND,                                         NULL, true	 },
+		{ LXC_AUTO_PROC_MASK, LXC_AUTO_PROC_MIXED, "%r/proc/sys/net",                                "%r/proc/tty",                NULL,    MS_BIND,                                         NULL, true, },
 		{ LXC_AUTO_PROC_MASK, LXC_AUTO_PROC_MIXED, "%r/proc/sys",                                    "%r/proc/sys",                NULL,    MS_BIND,                                         NULL, false },
 		{ LXC_AUTO_PROC_MASK, LXC_AUTO_PROC_MIXED, NULL,                                             "%r/proc/sys",                NULL,    MS_REMOUNT|MS_BIND|MS_RDONLY,                    NULL, false },
 		{ LXC_AUTO_PROC_MASK, LXC_AUTO_PROC_MIXED, "%r/proc/tty",                                    "%r/proc/sys/net",            NULL,    MS_MOVE,                                         NULL, true  },
@@ -620,12 +708,9 @@ static int lxc_mount_auto_mounts(struct lxc_handler *handler, int flags)
 		{ LXC_AUTO_PROC_MASK, LXC_AUTO_PROC_RW,    "proc",                                           "%r/proc",                    "proc",  MS_NODEV|MS_NOEXEC|MS_NOSUID,                    NULL, false },
 		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_RW,     "sysfs",                                          "%r/sys",                     "sysfs", 0,                                               NULL, false },
 		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_RO,     "sysfs",                                          "%r/sys",                     "sysfs", MS_RDONLY,                                       NULL, false },
-		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  "sysfs",                                          "%r/sys",                     "sysfs", MS_NODEV|MS_NOEXEC|MS_NOSUID,                    NULL, false },
-		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  "%r/sys",                                         "%r/sys",                     NULL,    MS_BIND,                                         NULL, false },
-		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  NULL,                                             "%r/sys",                     NULL,    MS_REMOUNT|MS_BIND|MS_RDONLY,                    NULL, false },
-		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  "sysfs",                                          "%r/sys/devices/virtual/net", "sysfs", 0,                                               NULL, false },
-		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  "%r/sys/devices/virtual/net/devices/virtual/net", "%r/sys/devices/virtual/net", NULL,    MS_BIND,                                         NULL, false },
-		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  NULL,                                             "%r/sys/devices/virtual/net", NULL,    MS_REMOUNT|MS_BIND|MS_NOSUID|MS_NODEV|MS_NOEXEC, NULL, false },
+		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  "sysfs",                                          "%r/sys",                     "sysfs", MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC,          NULL, false },
+		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  "%r/sys/devices/virtual/net",                     "%r/sys/devices/virtual/net",  NULL,   MS_BIND,                                         NULL, false },
+		{ LXC_AUTO_SYS_MASK,  LXC_AUTO_SYS_MIXED,  NULL,                                             "%r/sys/devices/virtual/net",  NULL,   MS_REMOUNT|MS_NOSUID|MS_NODEV|MS_NOEXEC,         NULL, false },
 		{ 0,                  0,                   NULL,                                             NULL,                         NULL,    0,                                               NULL, false }
 	};
 	struct lxc_conf *conf = handler->conf;
@@ -633,39 +718,55 @@ static int lxc_mount_auto_mounts(struct lxc_handler *handler, int flags)
         bool has_cap_net_admin;
 
         if (flags & LXC_AUTO_PROC_MASK) {
-		ret = strnprintf(rootfs->buf, sizeof(rootfs->buf), "%s/proc",
-				 rootfs->path ? rootfs->mount : "");
-		if (ret < 0)
-			return ret_errno(EIO);
+		if (rootfs->path) {
+			/*
+			 * Only unmount procfs if we have a separate rootfs so
+			 * we can still access it in safe_mount() below.
+			 */
+			ret = strnprintf(rootfs->buf, sizeof(rootfs->buf), "%s/proc",
+					rootfs->path ? rootfs->mount : "");
+			if (ret < 0)
+				return ret_errno(EIO);
 
-		ret = umount2(rootfs->buf, MNT_DETACH);
-		if (ret)
-			SYSDEBUG("Tried to ensure procfs is unmounted");
+			ret = umount2(rootfs->buf, MNT_DETACH);
+			if (ret)
+				SYSDEBUG("Tried to ensure procfs is unmounted");
+		}
 
 		ret = mkdirat(rootfs->dfd_mnt, "proc" , S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
 		if (ret < 0 && errno != EEXIST)
 			return syserror("Failed to create procfs mountpoint under %d", rootfs->dfd_mnt);
+
+		TRACE("Created procfs mountpoint under %d", rootfs->dfd_mnt);
 	}
 
 	if (flags & LXC_AUTO_SYS_MASK) {
-		ret = strnprintf(rootfs->buf, sizeof(rootfs->buf), "%s/sys",
-				 rootfs->path ? rootfs->mount : "");
-		if (ret < 0)
-			return ret_errno(EIO);
+		if (rootfs->path) {
+			/*
+			 * Only unmount sysfs if we have a separate rootfs so
+			 * we can still access it in safe_mount() below.
+			 */
+			ret = strnprintf(rootfs->buf, sizeof(rootfs->buf), "%s/sys",
+					rootfs->path ? rootfs->mount : "");
+			if (ret < 0)
+				return ret_errno(EIO);
 
-		ret = umount2(rootfs->buf, MNT_DETACH);
-		if (ret)
-			SYSDEBUG("Tried to ensure sysfs is unmounted");
+			ret = umount2(rootfs->buf, MNT_DETACH);
+			if (ret)
+				SYSDEBUG("Tried to ensure sysfs is unmounted");
+		}
 
 		ret = mkdirat(rootfs->dfd_mnt, "sys" , S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
 		if (ret < 0 && errno != EEXIST)
 			return syserror("Failed to create sysfs mountpoint under %d", rootfs->dfd_mnt);
+
+		TRACE("Created sysfs mountpoint under %d", rootfs->dfd_mnt);
 	}
 
         has_cap_net_admin = lxc_wants_cap(CAP_NET_ADMIN, conf);
         for (i = 0; default_mounts[i].match_mask; i++) {
 		__do_free char *destination = NULL, *source = NULL;
-		unsigned long mflags;
+		unsigned long mflags = default_mounts[i].flags;
 
 		if ((flags & default_mounts[i].match_mask) != default_mounts[i].match_flag)
 			continue;
@@ -690,10 +791,10 @@ static int lxc_mount_auto_mounts(struct lxc_handler *handler, int flags)
 		if (!destination)
 			return syserror_set(-ENOMEM, "Failed to create target path");
 
-		mflags = add_required_remount_flags(source, destination,
-						    default_mounts[i].flags);
-		ret = safe_mount(source, destination, default_mounts[i].fstype,
-				 mflags, default_mounts[i].options,
+		ret = safe_mount(source, destination,
+				 default_mounts[i].fstype,
+				 mflags,
+				 default_mounts[i].options,
 				 rootfs->path ? rootfs->mount : NULL);
 		if (ret < 0) {
 			if (errno != ENOENT)
@@ -702,7 +803,11 @@ static int lxc_mount_auto_mounts(struct lxc_handler *handler, int flags)
 			INFO("Mount source or target for \"%s\" on \"%s\" does not exist. Skipping", source, destination);
 			continue;
 		}
-		TRACE("Mounted automount \"%s\" on \"%s\" with flags %lu", source, destination, mflags);
+
+		if (mflags & MS_REMOUNT)
+			TRACE("Remounted automount \"%s\" on \"%s\" %s with flags %lu", source, destination, (mflags & MS_RDONLY) ? "read-only" : "read-write", mflags);
+		else
+			TRACE("Mounted automount \"%s\" on \"%s\" %s with flags %lu", source, destination, (mflags & MS_RDONLY) ? "read-only" : "read-write", mflags);
 	}
 
 	if (flags & LXC_AUTO_CGROUP_MASK) {
@@ -1011,7 +1116,7 @@ void lxc_delete_tty(struct lxc_tty_info *ttys)
 	free_disarm(ttys->tty);
 }
 
-static int lxc_send_ttys_to_parent(struct lxc_handler *handler)
+static int __lxc_send_ttys_to_parent(struct lxc_handler *handler)
 {
 	int i;
 	int ret = -1;
@@ -1056,12 +1161,6 @@ static int lxc_create_ttys(struct lxc_handler *handler)
 		goto on_error;
 	}
 
-	ret = lxc_send_ttys_to_parent(handler);
-	if (ret < 0) {
-		ERROR("Failed to send ttys to parent");
-		goto on_error;
-	}
-
 	if (!conf->is_execute) {
 		ret = lxc_setup_ttys(conf);
 		if (ret < 0) {
@@ -1072,15 +1171,26 @@ static int lxc_create_ttys(struct lxc_handler *handler)
 
 	if (conf->ttys.tty_names) {
 		ret = setenv("container_ttys", conf->ttys.tty_names, 1);
-		if (ret < 0)
+		if (ret < 0) {
 			SYSERROR("Failed to set \"container_ttys=%s\"", conf->ttys.tty_names);
+			goto on_error;
+		}
 	}
 
-	ret = 0;
+	return 0;
 
 on_error:
 	lxc_delete_tty(&conf->ttys);
 
+	return -1;
+}
+
+static int lxc_send_ttys_to_parent(struct lxc_handler *handler)
+{
+	int ret = -1;
+
+	ret = __lxc_send_ttys_to_parent(handler);
+	lxc_delete_tty(&handler->conf->ttys);
 	return ret;
 }
 
@@ -1122,7 +1232,9 @@ static int mount_autodev(const char *name, const struct lxc_rootfs *rootfs,
 		if (ret < 0)
 			return log_error_errno(-errno, errno, "Failed to mount tmpfs onto %d(dev)", fd_fs);
 
-		ret = fs_attach(fd_fs, rootfs->dfd_mnt, "dev", PROTECT_OPATH_DIRECTORY, PROTECT_LOOKUP_BENEATH, 0);
+		ret = fs_attach(fd_fs, rootfs->dfd_mnt, "dev",
+				PROTECT_OPATH_DIRECTORY,
+				PROTECT_LOOKUP_BENEATH_XDEV, 0);
 	} else {
 		__do_free char *fallback_path = NULL;
 
@@ -1140,7 +1252,6 @@ static int mount_autodev(const char *name, const struct lxc_rootfs *rootfs,
 		SYSERROR("Failed to mount tmpfs on \"%s\"", path);
 		goto reset_umask;
 	}
-
 
 	/* If we are running on a devtmpfs mapping, dev/pts may already exist.
 	 * If not, then create it and exit if that fails...
@@ -1282,11 +1393,9 @@ static int lxc_fill_autodev(struct lxc_rootfs *rootfs)
 	return 0;
 }
 
-static int lxc_mount_rootfs(struct lxc_conf *conf)
+static int lxc_mount_rootfs(struct lxc_rootfs *rootfs)
 {
 	int ret;
-	struct lxc_storage *bdev;
-	struct lxc_rootfs *rootfs = &conf->rootfs;
 
 	if (!rootfs->path) {
 		ret = mount("", "/", NULL, MS_SLAVE | MS_REC, 0);
@@ -1297,7 +1406,7 @@ static int lxc_mount_rootfs(struct lxc_conf *conf)
 		if (rootfs->dfd_mnt < 0)
 			return -errno;
 
-		return 0;
+		return log_trace(0, "Container doesn't use separate rootfs. Opened host's rootfs");
 	}
 
 	ret = access(rootfs->mount, F_OK);
@@ -1305,14 +1414,7 @@ static int lxc_mount_rootfs(struct lxc_conf *conf)
 		return log_error_errno(-1, errno, "Failed to access to \"%s\". Check it is present",
 				       rootfs->mount);
 
-	bdev = storage_init(conf);
-	if (!bdev)
-		return log_error(-1, "Failed to mount rootfs \"%s\" onto \"%s\" with options \"%s\"",
-				 rootfs->path, rootfs->mount,
-				 rootfs->options ? rootfs->options : "(null)");
-
-	ret = bdev->ops->mount(bdev);
-	storage_put(bdev);
+	ret = rootfs->storage->ops->mount(rootfs->storage);
 	if (ret < 0)
 		return log_error(-1, "Failed to mount rootfs \"%s\" onto \"%s\" with options \"%s\"",
 				 rootfs->path, rootfs->mount,
@@ -1326,7 +1428,7 @@ static int lxc_mount_rootfs(struct lxc_conf *conf)
 	if (rootfs->dfd_mnt < 0)
 		return -errno;
 
-	return 0;
+	return log_trace(0, "Container uses separate rootfs. Opened container's rootfs");
 }
 
 static int lxc_chroot(const struct lxc_rootfs *rootfs)
@@ -1534,7 +1636,7 @@ static const struct id_map *find_mapped_nsid_entry(const struct lxc_conf *conf,
 	return retmap;
 }
 
-int lxc_setup_devpts_parent(struct lxc_handler *handler)
+static int lxc_setup_devpts_parent(struct lxc_handler *handler)
 {
 	int ret;
 
@@ -1562,7 +1664,6 @@ static int lxc_setup_devpts_child(struct lxc_handler *handler)
 	char default_devpts_mntopts[256] = "gid=5,newinstance,ptmxmode=0666,mode=0620";
 	struct lxc_conf *conf = handler->conf;
 	struct lxc_rootfs *rootfs = &conf->rootfs;
-	int sock = handler->data_sock[0];
 
 	if (conf->pty_max <= 0)
 		return log_debug(0, "No new devpts instance will be mounted since no pts devices are requested");
@@ -1609,14 +1710,9 @@ static int lxc_setup_devpts_child(struct lxc_handler *handler)
 	if (devpts_fd < 0) {
 		devpts_fd = -EBADF;
 		TRACE("Failed to create detached devpts mount");
-		ret = lxc_abstract_unix_send_fds(sock, NULL, 0, &devpts_fd, sizeof(int));
-	} else {
-		ret = lxc_abstract_unix_send_fds(sock, &devpts_fd, 1, NULL, 0);
 	}
-	if (ret < 0)
-		return log_error_errno(-1, errno, "Failed to send devpts fd to parent");
 
-	TRACE("Sent devpts file descriptor %d to parent", devpts_fd);
+	handler->conf->devpts_fd = move_fd(devpts_fd);
 
 	/* Remove any pre-existing /dev/ptmx file. */
 	ret = unlinkat(rootfs->dfd_dev, "ptmx", 0);
@@ -1627,11 +1723,11 @@ static int lxc_setup_devpts_child(struct lxc_handler *handler)
 		DEBUG("Removed existing \"/dev/ptmx\" file");
 	}
 
-	/* Create dummy /dev/ptmx file as bind mountpoint for /dev/pts/ptmx. */
+	/* Create placeholder /dev/ptmx file as bind mountpoint for /dev/pts/ptmx. */
 	ret = mknodat(rootfs->dfd_dev, "ptmx", S_IFREG | 0000, 0);
 	if (ret < 0 && errno != EEXIST)
-		return log_error_errno(-1, errno, "Failed to create dummy \"/dev/ptmx\" file as bind mount target");
-	DEBUG("Created dummy \"/dev/ptmx\" file as bind mount target");
+		return log_error_errno(-1, errno, "Failed to create \"/dev/ptmx\" file as bind mount target");
+	DEBUG("Created \"/dev/ptmx\" file as bind mount target");
 
 	/* Fallback option: create symlink /dev/ptmx -> /dev/pts/ptmx  */
 	ret = mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL);
@@ -1641,7 +1737,7 @@ static int lxc_setup_devpts_child(struct lxc_handler *handler)
 		/* Fallthrough and try to create a symlink. */
 		ERROR("Failed to bind mount \"/dev/pts/ptmx\" to \"/dev/ptmx\"");
 
-	/* Remove the dummy /dev/ptmx file we created above. */
+	/* Remove the placeholder /dev/ptmx file we created above. */
 	ret = unlinkat(rootfs->dfd_dev, "ptmx", 0);
 	if (ret < 0)
 		return log_error_errno(-1, errno, "Failed to remove existing \"/dev/ptmx\"");
@@ -1655,21 +1751,36 @@ static int lxc_setup_devpts_child(struct lxc_handler *handler)
 	return 0;
 }
 
-static int setup_personality(int persona)
+static int lxc_send_devpts_to_parent(struct lxc_handler *handler)
 {
 	int ret;
 
-#if HAVE_SYS_PERSONALITY_H
-	if (persona == -1)
-		return 0;
+	if (handler->conf->pty_max <= 0)
+		return log_debug(0, "No devpts file descriptor will be sent since no pts devices are requested");
 
-	ret = personality(persona);
+	ret = lxc_abstract_unix_send_fds(handler->data_sock[0], &handler->conf->devpts_fd, 1, NULL, 0);
 	if (ret < 0)
-		return log_error_errno(-1, errno, "Failed to set personality to \"0x%x\"", persona);
+		SYSERROR("Failed to send devpts file descriptor %d to parent", handler->conf->devpts_fd);
+	else
+		TRACE("Sent devpts file descriptor %d to parent", handler->conf->devpts_fd);
 
-	INFO("Set personality to \"0x%x\"", persona);
-#endif
+	close_prot_errno_disarm(handler->conf->devpts_fd);
 
+	return 0;
+}
+
+static int setup_personality(personality_t persona)
+{
+	int ret;
+
+	if (persona == LXC_ARCH_UNCHANGED)
+		return log_debug(0, "Retaining original personality");
+
+	ret = lxc_personality(persona);
+	if (ret < 0)
+		return syserror("Failed to set personality to \"0lx%lx\"", persona);
+
+	INFO("Set personality to \"0lx%lx\"", persona);
 	return 0;
 }
 
@@ -1749,7 +1860,7 @@ static int lxc_setup_dev_console(struct lxc_rootfs *rootfs,
 
 	ret = fchmod(console->pty, 0620);
 	if (ret < 0)
-		return log_error_errno(-errno, errno, "Failed to set mode \"0%o\" to \"%s\"", S_IXUSR | S_IXGRP, console->name);
+		return log_error_errno(-errno, errno, "Failed to set mode \"0%o\" to \"%s\"", 0620, console->name);
 
 	if (can_use_mount_api()) {
 		ret = lxc_bind_mount_console(console, rootfs->dfd_dev, "console");
@@ -1811,7 +1922,7 @@ static int lxc_setup_ttydir_console(struct lxc_rootfs *rootfs,
 
 	ret = fchmod(console->pty, 0620);
 	if (ret < 0)
-		return log_error_errno(-errno, errno, "Failed to set mode \"0%o\" to \"%s\"", S_IXUSR | S_IXGRP, console->name);
+		return log_error_errno(-errno, errno, "Failed to set mode \"0%o\" to \"%s\"", 0620, console->name);
 
 	/* bind mount console->name to '/dev/<ttydir>/console' */
 	if (can_use_mount_api()) {
@@ -1896,9 +2007,9 @@ static int parse_mntopt(char *opt, unsigned long *flags, char **data, size_t siz
 
 			if (opt_len == mo_name_len && strnequal(opt, mo->name, mo_name_len)) {
 				if (mo->clear)
-					*flags &= ~mo->flag;
+					*flags &= ~mo->legacy_flag;
 				else
-					*flags |= mo->flag;
+					*flags |= mo->legacy_flag;
 				return 0;
 			}
 		}
@@ -1917,7 +2028,7 @@ static int parse_mntopt(char *opt, unsigned long *flags, char **data, size_t siz
 	return 0;
 }
 
-int parse_mntopts(const char *mntopts, unsigned long *mntflags, char **mntdata)
+int parse_mntopts_legacy(const char *mntopts, unsigned long *mntflags, char **mntdata)
 {
 	__do_free char *mntopts_new = NULL, *mntopts_dup = NULL;
 	char *mntopt_cur = NULL;
@@ -1948,6 +2059,102 @@ int parse_mntopts(const char *mntopts, unsigned long *mntflags, char **mntdata)
 	return 0;
 }
 
+static int parse_vfs_attr(struct lxc_mount_options *opts, char *opt, size_t size)
+{
+	/*
+	 * If opt is found in mount_opt, set or clear flags.
+	 * Otherwise append it to data.
+	 */
+	for (struct mount_opt *mo = &mount_opt[0]; mo->name != NULL; mo++) {
+		if (!strnequal(opt, mo->name, strlen(mo->name)))
+			continue;
+
+		/* This is a recursive bind-mount. */
+		if (strequal(mo->name, "rbind")) {
+			opts->recursive = 1;
+			opts->bind = 1;
+			return 0;
+		}
+
+		/* This is a bind-mount. */
+		if (strequal(mo->name, "bind")) {
+			opts->bind = 1;
+			return 0;
+		}
+
+		if (mo->flag == ~0)
+			return log_info(0, "Ignoring %s mount option", mo->name);
+
+		if (mo->clear) {
+			opts->attr.attr_clr |= mo->flag;
+			TRACE("Lowering %s", mo->name);
+		} else {
+			opts->attr.attr_set |= mo->flag;
+			TRACE("Raising %s", mo->name);
+		}
+
+		return 0;
+	}
+
+	for (struct mount_opt *mo = &mount_opt[0]; mo->name != NULL; mo++) {
+		if (!strnequal(opt, mo->name, strlen(mo->name)))
+			continue;
+
+		/* TODO: Handle recursive propagation requests. */
+		opts->attr.propagation = mo->flag;
+		return 0;
+	}
+
+	return 0;
+}
+
+static int parse_mount_attrs(struct lxc_mount_options *opts, const char *mntopts)
+{
+	__do_free char *mntopts_new = NULL, *mntopts_dup = NULL;
+	char *end = NULL, *mntopt_cur = NULL;
+	int ret;
+	size_t size;
+
+	if (!opts)
+		return ret_errno(EINVAL);
+
+	if (!mntopts)
+		return 0;
+
+	mntopts_dup = strdup(mntopts);
+	if (!mntopts_dup)
+		return ret_errno(ENOMEM);
+
+	size = strlen(mntopts_dup) + 1;
+	mntopts_new = zalloc(size);
+	if (!mntopts_new)
+		return ret_errno(ENOMEM);
+
+	lxc_iterate_parts(mntopt_cur, mntopts_dup, ",") {
+		/* This is a filesystem specific option. */
+		if (strchr(mntopt_cur, '=')) {
+			if (!end) {
+				end = stpcpy(mntopts_new, mntopt_cur);
+			} else {
+				end = stpcpy(end, ",");
+				end = stpcpy(end, mntopt_cur);
+			}
+
+			continue;
+		}
+
+		/* This is a generic vfs option. */
+		ret = parse_vfs_attr(opts, mntopt_cur, size);
+		if (ret < 0)
+			return syserror("Failed to parse mount attributes: \"%s\"", mntopt_cur);
+	}
+
+	if (*mntopts_new)
+		opts->data = move_ptr(mntopts_new);
+
+	return 0;
+}
+
 static void parse_propagationopt(char *opt, unsigned long *flags)
 {
 	struct mount_opt *mo;
@@ -1958,9 +2165,9 @@ static void parse_propagationopt(char *opt, unsigned long *flags)
 			continue;
 
 		if (mo->clear)
-			*flags &= ~mo->flag;
+			*flags &= ~mo->legacy_flag;
 		else
-			*flags |= mo->flag;
+			*flags |= mo->legacy_flag;
 
 		return;
 	}
@@ -2121,16 +2328,16 @@ const char *lxc_mount_options_info[LXC_MOUNT_MAX] = {
 };
 
 /* Remove "optional", "create=dir", and "create=file" from mntopt */
-int parse_lxc_mntopts(struct lxc_mount_options *opts, char *mnt_opts)
+int parse_lxc_mount_attrs(struct lxc_mount_options *opts, char *mnt_opts)
 {
 	for (size_t i = LXC_MOUNT_CREATE_DIR; i < LXC_MOUNT_MAX; i++) {
 		__do_close int fd_userns = -EBADF;
 		const char *opt_name = lxc_mount_options_info[i];
 		size_t len;
-		char *idmap_path, *p, *p2;
+		char *idmap_path, *opt, *opt_next;
 
-		p = strstr(mnt_opts, opt_name);
-		if (!p)
+		opt = strstr(mnt_opts, opt_name);
+		if (!opt)
 			continue;
 
 		switch (i) {
@@ -2147,20 +2354,24 @@ int parse_lxc_mntopts(struct lxc_mount_options *opts, char *mnt_opts)
 			opts->relative = 1;
 			break;
 		case LXC_MOUNT_IDMAP:
-			p2 = p;
-			p2 += STRLITERALLEN("idmap=");
-			idmap_path = strchrnul(p2, ',');
+			opt_next = opt;
+			opt_next += STRLITERALLEN("idmap=");
+			idmap_path = strchrnul(opt_next, ',');
+			len = idmap_path - opt_next + 1;
 
-			len = strlcpy(opts->userns_path, p2, idmap_path - p2 + 1);
 			if (len >= sizeof(opts->userns_path))
 				return syserror_set(-EIO, "Excessive idmap path length for \"idmap=<path>\" LXC specific mount option");
+
+			strlcpy(opts->userns_path, opt_next, len);
 
 			if (is_empty_string(opts->userns_path))
 				return syserror_set(-EINVAL, "Missing idmap path for \"idmap=<path>\" LXC specific mount option");
 
-			fd_userns = open(opts->userns_path, O_RDONLY | O_NOCTTY | O_CLOEXEC);
-			if (fd_userns < 0)
-				return syserror("Failed to open user namespace");
+			if (!strequal(opts->userns_path, "container")) {
+				fd_userns = open(opts->userns_path, O_RDONLY | O_NOCTTY | O_CLOEXEC);
+				if (fd_userns < 0)
+					return syserror("Failed to open user namespace %s", opts->userns_path);
+			}
 
 			TRACE("Parse LXC specific mount option %d->\"idmap=%s\"", fd_userns, opts->userns_path);
 			break;
@@ -2168,11 +2379,11 @@ int parse_lxc_mntopts(struct lxc_mount_options *opts, char *mnt_opts)
 			return syserror_set(-EINVAL, "Unknown LXC specific mount option");
 		}
 
-		p2 = strchr(p, ',');
-		if (!p2)
-			*p = '\0'; /* no more mntopts, so just chop it here */
+		opt_next = strchr(opt, ',');
+		if (!opt_next)
+			*opt = '\0'; /* no more mntopts, so just chop it here */
 		else
-			memmove(p, p2 + 1, strlen(p2 + 1) + 1);
+			memmove(opt, opt_next + 1, strlen(opt_next + 1) + 1);
 	}
 
 	return 0;
@@ -2254,18 +2465,25 @@ static inline int mount_entry_on_generic(struct mntent *mntent,
 		return -1;
 	}
 
-	ret = parse_lxc_mntopts(&opts, mntent->mnt_opts);
+	ret = parse_lxc_mount_attrs(&opts, mntent->mnt_opts);
 	if (ret < 0)
 		return ret;
 
+	/*
+	 * Idmapped mount entries will be setup by the parent for us. Note that
+	 * we rely on mount_entry_create_dir_file() above to have already
+	 * created the target path for us. So the parent can just open the
+	 * target and send us the target fd.
+	 */
+	errno = EOPNOTSUPP;
 	if (!is_empty_string(opts.userns_path))
-		return syserror_set(-EINVAL, "Idmapped mount entries not yet supported");
+		return systrace_ret(0, "Skipping idmapped mount entry");
 
 	ret = parse_propagationopts(mntent->mnt_opts, &pflags);
 	if (ret < 0)
 		return -1;
 
-	ret = parse_mntopts(mntent->mnt_opts, &mntflags, &mntdata);
+	ret = parse_mntopts_legacy(mntent->mnt_opts, &mntflags, &mntdata);
 	if (ret < 0)
 		return ret;
 
@@ -2484,6 +2702,234 @@ static int setup_mount_entries(const struct lxc_conf *conf,
 		return -1;
 
 	return mount_file_entries(rootfs, f, lxc_name, lxc_path);
+}
+
+static int __lxc_idmapped_mounts_child(struct lxc_handler *handler, FILE *f)
+{
+	struct lxc_conf *conf = handler->conf;
+	struct lxc_rootfs *rootfs = &conf->rootfs;
+	int mnt_seq = 0;
+	int ret;
+	char buf[PATH_MAX];
+	struct mntent mntent;
+
+	while (getmntent_r(f, &mntent, buf, sizeof(buf))) {
+		__do_close int fd_from = -EBADF, fd_to = -EBADF,
+			       fd_userns = -EBADF;
+		__do_free char *__data = NULL;
+		int cur_mnt_seq = -1;
+		struct lxc_mount_options opts = {};
+		int dfd_from;
+		const char *source_relative, *target_relative;
+
+		ret = parse_lxc_mount_attrs(&opts, mntent.mnt_opts);
+		if (ret < 0)
+			return syserror("Failed to parse LXC specific mount options");
+		__data = opts.data;
+
+		ret = parse_mount_attrs(&opts, mntent.mnt_opts);
+		if (ret < 0)
+			return syserror("Failed to parse mount options");
+
+		/* No idmapped mount entry so skip it. */
+		if (is_empty_string(opts.userns_path))
+			continue;
+
+		if (!can_use_bind_mounts())
+			return syserror_set(-EINVAL, "Kernel does not support idmapped mounts");
+
+		if (!opts.bind)
+			return syserror_set(-EINVAL, "Only bind mounts can currently be idmapped");
+
+		/* We don't support new filesystem mounts yet. */
+		if (!is_empty_string(mntent.mnt_type) &&
+		    !strequal(mntent.mnt_type, "none"))
+			return syserror_set(-EINVAL, "Only bind mounts can currently be idmapped");
+
+		/* Someone specified additional mount options for a bind-mount. */
+		if (!is_empty_string(opts.data))
+			return syserror_set(-EINVAL, "Bind mounts don't support non-generic mount options");
+
+		/*
+		 * The source path is supposed to be taken relative to the
+		 * container's rootfs mount or - if the container does not have
+		 * a separate rootfs - to the host's /.
+		 */
+		source_relative = deabs(mntent.mnt_fsname);
+		if (opts.relative || !rootfs->path)
+			dfd_from = rootfs->dfd_mnt;
+		else
+			dfd_from = rootfs->dfd_host;
+		fd_from = open_tree(dfd_from, source_relative,
+				    OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC |
+				    (opts.recursive ? AT_RECURSIVE : 0));
+		if (fd_from < 0)
+			return syserror("Failed to create detached %smount of %d/%s",
+					opts.recursive ? "recursive " : "",
+					dfd_from, source_relative);
+
+		if (strequal(opts.userns_path, "container"))
+			fd_userns = openat(dfd_from, "proc/self/ns/user", O_RDONLY | O_CLOEXEC);
+		else
+			fd_userns = open_at(-EBADF, opts.userns_path,
+					    PROTECT_OPEN_WITH_TRAILING_SYMLINKS, 0, 0);
+		if (fd_userns < 0) {
+			if (opts.optional) {
+				TRACE("Skipping optional idmapped mount");
+				continue;
+			}
+
+			return syserror("Failed to open user namespace \"%s\" for detached %smount of %d/%s",
+					opts.userns_path, opts.recursive ? "recursive " : "",
+					dfd_from, source_relative);
+		}
+
+		ret = __lxc_abstract_unix_send_two_fds(handler->data_sock[0],
+						       fd_from, fd_userns,
+						       &opts, sizeof(opts));
+		if (ret <= 0) {
+			if (opts.optional) {
+				TRACE("Skipping optional idmapped mount");
+				continue;
+			}
+
+			return syserror("Failed to send file descriptor %d for detached %smount of %d/%s and file descriptor %d of user namespace \"%s\" to parent",
+					fd_from, opts.recursive ? "recursive " : "",
+					dfd_from, source_relative, fd_userns,
+					opts.userns_path);
+		}
+
+		ret = lxc_abstract_unix_rcv_credential(handler->data_sock[0],
+						       &cur_mnt_seq,
+						       sizeof(cur_mnt_seq));
+		if (ret <= 0) {
+			if (opts.optional) {
+				TRACE("Skipping optional idmapped mount");
+				continue;
+			}
+
+			return syserror("Failed to receive notification that parent idmapped detached %smount %d/%s to user namespace %d",
+					opts.recursive ? "recursive " : "",
+					dfd_from, source_relative, fd_userns);
+		}
+
+		if (mnt_seq != cur_mnt_seq)
+			return syserror("Expected mount sequence number and mount sequence number from parent mismatch: %d != %d",
+					mnt_seq, cur_mnt_seq);
+		mnt_seq++;
+
+		/* Set remaining mount options. */
+		ret = mount_setattr(fd_from, "", AT_EMPTY_PATH |
+				    (opts.recursive ? AT_RECURSIVE : 0),
+				    &opts.attr, sizeof(opts.attr));
+		if (ret < 0) {
+			if (opts.optional) {
+				TRACE("Skipping optional idmapped mount");
+				continue;
+			}
+
+			return syserror("Failed to receive notification that parent idmapped detached %smount %d/%s to user namespace %d",
+					opts.recursive ? "recursive " : "",
+					dfd_from, source_relative, fd_userns);
+		}
+
+		/*
+		 * In contrast to the legacy mount codepath we will simplify
+		 * our lifes and just always treat the target mountpoint to be
+		 * relative to the container's rootfs mountpoint or - if the
+		 * container does not have a separate rootfs - to the host's /.
+		 */
+
+		target_relative = deabs(mntent.mnt_dir);
+		if (rootfs->path)
+			dfd_from = rootfs->dfd_mnt;
+		else
+			dfd_from = rootfs->dfd_host;
+		fd_to = open_at(dfd_from, target_relative, PROTECT_OPATH_FILE, PROTECT_LOOKUP_BENEATH_WITH_SYMLINKS, 0);
+		if (fd_to < 0) {
+			if (opts.optional) {
+				TRACE("Skipping optional idmapped mount");
+				continue;
+			}
+
+			return syserror("Failed to open target mountpoint %d/%s for detached idmapped %smount %d:%d/%s",
+					dfd_from, target_relative,
+					opts.recursive ? "recursive " : "",
+					fd_userns, dfd_from, source_relative);
+		}
+
+		ret = move_detached_mount(fd_from, fd_to, "", 0, 0);
+		if (ret) {
+			if (opts.optional) {
+				TRACE("Skipping optional idmapped mount");
+				continue;
+			}
+
+			return syserror("Failed to attach detached idmapped %smount %d:%d/%s to target mountpoint %d/%s",
+					opts.recursive ? "recursive " : "",
+					fd_userns, dfd_from, source_relative, dfd_from, target_relative);
+		}
+
+		TRACE("Attached detached idmapped %smount %d:%d/%s to target mountpoint %d/%s",
+		      opts.recursive ? "recursive " : "", fd_userns, dfd_from,
+		      source_relative, dfd_from, target_relative);
+	}
+
+	if (!feof(f) || ferror(f))
+		return syserror_set(-EINVAL, "Failed to parse mount entries");
+
+	return 0;
+}
+
+static int lxc_idmapped_mounts_child(struct lxc_handler *handler)
+{
+	__do_fclose FILE *f_entries = NULL;
+	int fret = -1;
+	struct lxc_conf *conf = handler->conf;
+	const char *fstab = conf->fstab;
+	struct lxc_list *mount = &conf->mount_list;
+	int ret;
+
+	f_entries = make_anonymous_mount_file(mount, conf->lsm_aa_allow_nesting);
+	if (!f_entries) {
+		SYSERROR("Failed to create anonymous mount file");
+		goto out;
+	}
+
+	ret = __lxc_idmapped_mounts_child(handler, f_entries);
+	if (ret) {
+		SYSERROR("Failed to setup idmapped mount entries");
+		goto out;
+	}
+
+	TRACE("Finished setting up idmapped mounts");
+
+	if (fstab) {
+		__do_endmntent FILE *f_fstab = NULL;
+
+		f_fstab = setmntent(fstab, "re");
+		if (!f_fstab) {
+			SYSERROR("Failed to open fstab format file \"%s\"", fstab);
+			goto out;
+		}
+
+		ret = __lxc_idmapped_mounts_child(handler, f_fstab);
+		if (ret) {
+			SYSERROR("Failed to setup idmapped mount entries specified in fstab");
+			goto out;
+		}
+
+		TRACE("Finished setting up idmapped mounts specified in fstab");
+	}
+
+	fret = 0;
+
+out:
+	ret = lxc_abstract_unix_send_credential(handler->data_sock[0], NULL, 0);
+	if (ret < 0)
+		return syserror("Failed to inform child that we are done setting up mounts");
+
+	return fret;
 }
 
 static int parse_cap(const char *cap)
@@ -2723,7 +3169,7 @@ struct lxc_conf *lxc_conf_init(void)
 		return NULL;
 
 	new->loglevel = LXC_LOG_LEVEL_NOTSET;
-	new->personality = -1;
+	new->personality = LXC_ARCH_UNCHANGED;
 	new->autodev = 1;
 	new->console.buffer_size = 0;
 	new->console.log_path = NULL;
@@ -2751,7 +3197,7 @@ struct lxc_conf *lxc_conf_init(void)
 	new->rootfs.dfd_dev = -EBADF;
 	new->rootfs.dfd_host = -EBADF;
 	new->rootfs.fd_path_pin = -EBADF;
-	new->rootfs.mnt_opts.userns_fd = -EBADF;
+	new->rootfs.dfd_idmapped = -EBADF;
 	new->logfd = -1;
 	lxc_list_init(&new->cgroup);
 	lxc_list_init(&new->cgroup2);
@@ -2901,6 +3347,9 @@ static int lxc_map_ids_exec_wrapper(void *args)
 	return -1;
 }
 
+static struct id_map *find_mapped_hostid_entry(const struct lxc_list *idmap,
+					       unsigned id, enum idtype idtype);
+
 int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 {
 	int fill, left;
@@ -2914,11 +3363,21 @@ int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 	char mapbuf[STRLITERALLEN("new@idmap") + STRLITERALLEN(" ") +
 		    INTTYPE_TO_STRLEN(pid_t) + STRLITERALLEN(" ") +
 		    LXC_IDMAPLEN] = {0};
-	bool had_entry = false, use_shadow = false;
+	bool had_entry = false, maps_host_root = false, use_shadow = false;
 	int hostuid, hostgid;
 
 	hostuid = geteuid();
 	hostgid = getegid();
+
+	/*
+	 * Check whether caller wants to map host root.
+	 * Due to a security fix newer kernels require CAP_SETFCAP when mapping
+	 * host root into the child userns as you would be able to write fscaps
+	 * that would be valid in the ancestor userns. Mapping host root should
+	 * rarely be the case but LXC is being clever in a bunch of cases.
+	 */
+	if (find_mapped_hostid_entry(idmap, 0, ID_TYPE_UID))
+		maps_host_root = true;
 
 	/* If new{g,u}idmap exists, that is, if shadow is handing out subuid
 	 * ranges, then insist that root also reserve ranges in subuid. This
@@ -2937,7 +3396,9 @@ int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 	else if (!gidmap)
 		WARN("newgidmap is lacking necessary privileges");
 
-	if (uidmap > 0 && gidmap > 0) {
+	if (maps_host_root) {
+		INFO("Caller maps host root. Writing mapping directly");
+	} else if (uidmap > 0 && gidmap > 0) {
 		DEBUG("Functional newuidmap and newgidmap binary found");
 		use_shadow = true;
 	} else {
@@ -2951,7 +3412,7 @@ int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 	}
 
 	/* Check if we really need to use newuidmap and newgidmap.
-	* If the user is only remapping his own {g,u}id, we don't need it.
+	* If the user is only remapping their own {g,u}id, we don't need it.
 	*/
 	if (use_shadow && lxc_list_len(idmap) == 2) {
 		use_shadow = false;
@@ -3267,58 +3728,6 @@ static void turn_into_dependent_mounts(const struct lxc_rootfs *rootfs)
 	TRACE("Turned all mount table entries into dependent mount");
 }
 
-static int lxc_execute_bind_init(struct lxc_handler *handler)
-{
-	int ret;
-	char *p;
-	char path[PATH_MAX], destpath[PATH_MAX];
-	struct lxc_conf *conf = handler->conf;
-
-	/* If init exists in the container, don't bind mount a static one */
-	p = choose_init(conf->rootfs.mount);
-	if (p) {
-		__do_free char *old = p;
-
-		p = strdup(old + strlen(conf->rootfs.mount));
-		if (!p)
-			return -ENOMEM;
-
-		INFO("Found existing init at \"%s\"", p);
-		goto out;
-	}
-
-	ret = strnprintf(path, sizeof(path), SBINDIR "/init.lxc.static");
-	if (ret < 0)
-		return -1;
-
-	if (!file_exists(path))
-		return log_error_errno(-1, errno, "The file \"%s\" does not exist on host", path);
-
-	ret = strnprintf(destpath, sizeof(path), "%s" P_tmpdir "%s", conf->rootfs.mount, "/.lxc-init");
-	if (ret < 0)
-		return -1;
-
-	if (!file_exists(destpath)) {
-		ret = mknod(destpath, S_IFREG | 0000, 0);
-		if (ret < 0 && errno != EEXIST)
-			return log_error_errno(-1, errno, "Failed to create dummy \"%s\" file as bind mount target", destpath);
-	}
-
-	ret = safe_mount(path, destpath, "none", MS_BIND, NULL, conf->rootfs.mount);
-	if (ret < 0)
-		return log_error_errno(-1, errno, "Failed to bind mount lxc.init.static into container");
-
-	p = strdup(destpath + strlen(conf->rootfs.mount));
-	if (!p)
-		return -ENOMEM;
-
-	INFO("Bind mounted lxc.init.static into container at \"%s\"", path);
-out:
-	((struct execute_args *)handler->data)->init_fd = -1;
-	((struct execute_args *)handler->data)->init_path = p;
-	return 0;
-}
-
 /* This does the work of remounting / if it is shared, calling the container
  * pre-mount hooks, and mounting the rootfs.
  */
@@ -3355,7 +3764,7 @@ int lxc_setup_rootfs_prepare_root(struct lxc_conf *conf, const char *name,
 	if (ret < 0)
 		return log_error(-1, "Failed to run pre-mount hooks");
 
-	ret = lxc_mount_rootfs(conf);
+	ret = lxc_mount_rootfs(&conf->rootfs);
 	if (ret < 0)
 		return log_error(-1, "Failed to setup rootfs for");
 
@@ -3384,15 +3793,6 @@ static bool verify_start_hooks(struct lxc_conf *conf)
 
 		return true;
 	}
-
-	return true;
-}
-
-static bool execveat_supported(void)
-{
-	execveat(-1, "", NULL, NULL, AT_EMPTY_PATH);
-	if (errno == ENOSYS)
-		return false;
 
 	return true;
 }
@@ -3484,11 +3884,174 @@ static int lxc_setup_keyring(struct lsm_ops *lsm_ops, const struct lxc_conf *con
 	return ret;
 }
 
+static int lxc_rootfs_prepare_child(struct lxc_handler *handler)
+{
+	struct lxc_rootfs *rootfs = &handler->conf->rootfs;
+	int dfd_idmapped = -EBADF;
+	int ret;
+
+	if (lxc_list_empty(&handler->conf->id_map))
+		return 0;
+
+	if (is_empty_string(rootfs->mnt_opts.userns_path))
+		return 0;
+
+	if (handler->conf->rootfs_setup)
+		return 0;
+
+	ret = lxc_abstract_unix_recv_one_fd(handler->data_sock[1], &dfd_idmapped, NULL, 0);
+	if (ret < 0)
+		return syserror("Failed to receive idmapped mount fd");
+
+	rootfs->dfd_idmapped = dfd_idmapped;
+	TRACE("Received detached idmapped mount %d", rootfs->dfd_idmapped);
+	return 0;
+}
+
+int lxc_idmapped_mounts_parent(struct lxc_handler *handler)
+{
+	int mnt_seq = 0;
+
+	for (;;) {
+		__do_close int fd_from = -EBADF, fd_userns = -EBADF;
+		struct lxc_mount_attr attr = {};
+		struct lxc_mount_options opts = {};
+		ssize_t ret;
+
+		ret = __lxc_abstract_unix_recv_two_fds(handler->data_sock[1],
+						       &fd_from, &fd_userns,
+						       &opts, sizeof(opts));
+		if (ret < 0)
+			return syserror("Failed to receive idmapped mount file descriptors from child");
+
+		if (fd_from < 0 || fd_userns < 0)
+			return log_trace(0, "Finished receiving idmapped mount file descriptors from child");
+
+		attr.attr_set	= MOUNT_ATTR_IDMAP;
+		attr.userns_fd	= fd_userns;
+		ret = mount_setattr(fd_from, "",
+				    AT_EMPTY_PATH |
+				    (opts.recursive ? AT_RECURSIVE : 0),
+				    &attr, sizeof(attr));
+		if (ret)
+			return syserror("Failed to idmap detached %smount %d to %d",
+					opts.recursive ? "recursive " : "",
+					fd_from, fd_userns);
+
+		ret = lxc_abstract_unix_send_credential(handler->data_sock[1],
+							&mnt_seq,
+							sizeof(mnt_seq));
+		if (ret < 0)
+			return syserror("Parent failed to notify child that detached %smount %d was idmapped to user namespace %d",
+					opts.recursive ? "recursive " : "",
+					fd_from, fd_userns);
+
+		TRACE("Parent idmapped detached %smount %d to user namespace %d",
+		      opts.recursive ? "recursive " : "", fd_from, fd_userns);
+		mnt_seq++;
+	}
+}
+
+static int lxc_recv_ttys_from_child(struct lxc_handler *handler)
+{
+	int i;
+	struct lxc_terminal_info *tty;
+	int ret = -1;
+	int sock = handler->data_sock[1];
+	struct lxc_conf *conf = handler->conf;
+	struct lxc_tty_info *ttys = &conf->ttys;
+
+	if (!conf->ttys.max)
+		return 0;
+
+	ttys->tty = malloc(sizeof(*ttys->tty) * ttys->max);
+	if (!ttys->tty)
+		return -1;
+
+	for (i = 0; i < conf->ttys.max; i++) {
+		int ttyx = -EBADF, ttyy = -EBADF;
+
+		ret = lxc_abstract_unix_recv_two_fds(sock, &ttyx, &ttyy);
+		if (ret < 0)
+			break;
+
+		tty = &ttys->tty[i];
+		tty->busy = -1;
+		tty->ptx = ttyx;
+		tty->pty = ttyy;
+		TRACE("Received pty with ptx fd %d and pty fd %d from child", tty->ptx, tty->pty);
+	}
+
+	if (ret < 0)
+		SYSERROR("Failed to receive %zu ttys from child", ttys->max);
+	else
+		TRACE("Received %zu ttys from child", ttys->max);
+
+	return ret;
+}
+
+int lxc_sync_fds_parent(struct lxc_handler *handler)
+{
+	int ret;
+
+	ret = lxc_seccomp_recv_notifier_fd(&handler->conf->seccomp, handler->data_sock[1]);
+	if (ret < 0)
+		return syserror_ret(ret, "Failed to receive seccomp notify fd from child");
+
+	ret = lxc_setup_devpts_parent(handler);
+	if (ret < 0)
+		return syserror_ret(ret, "Failed to receive devpts fd from child");
+
+	/* Read tty fds allocated by child. */
+	ret = lxc_recv_ttys_from_child(handler);
+	if (ret < 0)
+		return syserror_ret(ret, "Failed to receive tty info from child process");
+
+	if (handler->ns_clone_flags & CLONE_NEWNET) {
+		ret = lxc_network_recv_name_and_ifindex_from_child(handler);
+		if (ret < 0)
+			return syserror_ret(ret, "Failed to receive names and ifindices for network devices from child");
+	}
+
+	TRACE("Finished syncing file descriptors with child");
+	return 0;
+}
+
+int lxc_sync_fds_child(struct lxc_handler *handler)
+{
+	int ret;
+
+	ret = lxc_seccomp_send_notifier_fd(&handler->conf->seccomp, handler->data_sock[0]);
+	if (ret < 0)
+		return syserror_ret(ret, "Failed to send seccomp notify fd to parent");
+
+	ret = lxc_send_devpts_to_parent(handler);
+	if (ret < 0)
+		return syserror_ret(ret, "Failed to send seccomp devpts fd to parent");
+
+	ret = lxc_send_ttys_to_parent(handler);
+	if (ret < 0)
+		return syserror_ret(ret, "Failed to send tty file descriptors to parent");
+
+	if (handler->ns_clone_flags & CLONE_NEWNET) {
+		ret = lxc_network_send_name_and_ifindex_to_parent(handler);
+		if (ret < 0)
+			return syserror_ret(ret, "Failed to send network device names and ifindices to parent");
+	}
+
+	TRACE("Finished syncing file descriptors with parent");
+	return 0;
+}
+
 int lxc_setup(struct lxc_handler *handler)
 {
 	int ret;
 	const char *lxcpath = handler->lxcpath, *name = handler->name;
 	struct lxc_conf *lxc_conf = handler->conf;
+
+	ret = lxc_rootfs_prepare_child(handler);
+	if (ret < 0)
+		return syserror("Failed to prepare rootfs");
 
 	ret = lxc_setup_rootfs_prepare_root(lxc_conf, name, lxcpath);
 	if (ret < 0)
@@ -3507,14 +4070,14 @@ int lxc_setup(struct lxc_handler *handler)
 	}
 
 	if (handler->ns_clone_flags & CLONE_NEWNET) {
+		ret = lxc_network_recv_from_parent(handler);
+		if (ret < 0)
+			return log_error(-1, "Failed to receive veth names from parent");
+
 		ret = lxc_setup_network_in_child_namespaces(lxc_conf,
 							    &lxc_conf->network);
 		if (ret < 0)
 			return log_error(-1, "Failed to setup network");
-
-		ret = lxc_network_send_name_and_ifindex_to_parent(handler);
-		if (ret < 0)
-			return log_error(-1, "Failed to send network device names and ifindices to parent");
 	}
 
 	if (lxc_conf->autodev > 0) {
@@ -3541,32 +4104,17 @@ int lxc_setup(struct lxc_handler *handler)
 			return log_error(-1, "Failed to setup mount entries");
 	}
 
+	if (!lxc_sync_wake_parent(handler, START_SYNC_IDMAPPED_MOUNTS))
+		return -1;
+
+	ret = lxc_idmapped_mounts_child(handler);
+	if (ret)
+		return syserror("Failed to attached detached idmapped mounts");
+
 	lxc_conf->rootfs.dfd_dev = open_at(lxc_conf->rootfs.dfd_mnt, "dev",
 					   PROTECT_OPATH_DIRECTORY, PROTECT_LOOKUP_BENEATH_XDEV, 0);
 	if (lxc_conf->rootfs.dfd_dev < 0 && errno != ENOENT)
 		return log_error_errno(-errno, errno, "Failed to open \"/dev\"");
-
-	if (lxc_conf->is_execute) {
-		if (execveat_supported()) {
-			int fd;
-			char path[STRLITERALLEN(SBINDIR) + STRLITERALLEN("/init.lxc.static") + 1];
-
-			ret = strnprintf(path, sizeof(path), SBINDIR "/init.lxc.static");
-			if (ret < 0)
-				return log_error(-1, "Path to init.lxc.static too long");
-
-			fd = open(path, O_NOCTTY | O_NOFOLLOW | O_CLOEXEC | O_PATH);
-			if (fd < 0)
-				return log_error_errno(-1, errno, "Unable to open lxc.init.static");
-
-			((struct execute_args *)handler->data)->init_fd = fd;
-			((struct execute_args *)handler->data)->init_path = NULL;
-		} else {
-			ret = lxc_execute_bind_init(handler);
-			if (ret < 0)
-				return log_error(-1, "Failed to bind-mount the lxc init system");
-		}
-	}
 
 	/* Now mount only cgroups, if wanted. Before, /sys could not have been
 	 * mounted. It is guaranteed to be mounted now either through
@@ -3625,7 +4173,7 @@ int lxc_setup(struct lxc_handler *handler)
 
 	ret = setup_personality(lxc_conf->personality);
 	if (ret < 0)
-		return log_error(-1, "Failed to set personality");
+		return syserror("Failed to set personality");
 
 	/* Set sysctl value to a path under /proc/sys as determined from the
 	 * key. For e.g. net.ipv4.ip_forward translated to
@@ -4026,7 +4574,6 @@ void lxc_conf_free(struct lxc_conf *conf)
 	free(conf->rootfs.bdev_type);
 	free(conf->rootfs.options);
 	free(conf->rootfs.path);
-	free(conf->rootfs.data);
 	put_lxc_rootfs(&conf->rootfs, true);
 	free(conf->logfile);
 	if (conf->logfd != -1)
@@ -4125,14 +4672,14 @@ static struct id_map *mapped_nsid_add(const struct lxc_conf *conf, unsigned id,
 	return retmap;
 }
 
-static struct id_map *find_mapped_hostid_entry(const struct lxc_conf *conf,
+static struct id_map *find_mapped_hostid_entry(const struct lxc_list *idmap,
 					       unsigned id, enum idtype idtype)
 {
 	struct id_map *map;
 	struct lxc_list *it;
 	struct id_map *retmap = NULL;
 
-	lxc_list_for_each (it, &conf->id_map) {
+	lxc_list_for_each (it, idmap) {
 		map = it->elem;
 		if (map->idtype != idtype)
 			continue;
@@ -4161,7 +4708,7 @@ static struct id_map *mapped_hostid_add(const struct lxc_conf *conf, uid_t id,
 		return NULL;
 
 	/* Reuse existing mapping. */
-	tmp = find_mapped_hostid_entry(conf, id, type);
+	tmp = find_mapped_hostid_entry(&conf->id_map, id, type);
 	if (tmp) {
 		memcpy(entry, tmp, sizeof(*entry));
 	} else {

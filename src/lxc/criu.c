@@ -359,7 +359,7 @@ static int exec_criu(struct cgroup_ops *cgroup_ops, struct lxc_conf *conf,
 		unsigned long flags = 0;
 		char arg[2 * PATH_MAX + 2];
 
-		if (parse_mntopts(mntent.mnt_opts, &flags, &mnt_options) < 0)
+		if (parse_mntopts_legacy(mntent.mnt_opts, &flags, &mnt_options) < 0)
 			return log_error_errno(-EINVAL, EINVAL, "Failed to parse mount options");
 
 		/* only add --ext-mount-map for actual bind mounts */
@@ -962,6 +962,10 @@ static void do_restore(struct lxc_container *c, int status_pipe, struct migrate_
 		pipes[0] = -1;
 
 		if (unshare(CLONE_NEWNS))
+			goto out_fini_handler;
+
+		ret = lxc_storage_prepare(c->lxc_conf);
+		if (ret)
 			goto out_fini_handler;
 
 		/* CRIU needs the lxc root bind mounted so that it is the root of some

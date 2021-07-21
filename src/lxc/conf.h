@@ -22,9 +22,13 @@
 #include "list.h"
 #include "lxcseccomp.h"
 #include "memory_utils.h"
+#include "namespace.h"
 #include "ringbuf.h"
 #include "start.h"
+#include "state.h"
+#include "storage/storage.h"
 #include "string_utils.h"
+#include "syscall_wrappers.h"
 #include "terminal.h"
 
 #if HAVE_SYS_RESOURCE_H
@@ -34,6 +38,8 @@
 #if HAVE_SCMP_FILTER_CTX
 typedef void * scmp_filter_ctx;
 #endif
+
+typedef signed long personality_t;
 
 /* worth moving to configure.ac? */
 #define subuidfile "/etc/subuid"
@@ -193,12 +199,17 @@ typedef enum lxc_mount_options_t {
 __hidden extern const char *lxc_mount_options_info[LXC_MOUNT_MAX];
 
 struct lxc_mount_options {
-	int create_dir : 1;
-	int create_file : 1;
-	int optional : 1;
-	int relative : 1;
+	unsigned int create_dir : 1;
+	unsigned int create_file : 1;
+	unsigned int optional : 1;
+	unsigned int relative : 1;
+	unsigned int recursive : 1;
+	unsigned int bind : 1;
 	char userns_path[PATH_MAX];
-	int userns_fd;
+	unsigned long mnt_flags;
+	unsigned long prop_flags;
+	char *data;
+	struct lxc_mount_attr attr;
 };
 
 /* Defines a structure to store the rootfs location, the
@@ -208,8 +219,6 @@ struct lxc_mount_options {
  * @buf		 : static buffer to construct paths
  * @bev_type     : optional backing store type
  * @options      : mount options
- * @mountflags   : the portion of @options that are flags
- * @data         : the portion of @options that are not flags
  * @managed      : whether it is managed by LXC
  * @dfd_mnt	 : fd for @mount
  * @dfd_dev : fd for /dev of the container
@@ -219,6 +228,7 @@ struct lxc_rootfs {
 
 	char *path;
 	int fd_path_pin;
+	int dfd_idmapped;
 
 	int dfd_mnt;
 	char *mount;
@@ -229,9 +239,9 @@ struct lxc_rootfs {
 	char *bdev_type;
 	char *options;
 	unsigned long mountflags;
-	char *data;
 	bool managed;
 	struct lxc_mount_options mnt_opts;
+	struct lxc_storage *storage;
 };
 
 /*
@@ -323,7 +333,7 @@ struct lxc_conf {
 	const char *name;
 	bool is_execute;
 	int reboot;
-	signed long personality;
+	personality_t personality;
 	struct utsname *utsname;
 
 	struct {
@@ -500,7 +510,12 @@ extern thread_local struct lxc_conf *current_config;
 __hidden extern int run_lxc_hooks(const char *name, char *hook, struct lxc_conf *conf, char *argv[]);
 __hidden extern struct lxc_conf *lxc_conf_init(void);
 __hidden extern void lxc_conf_free(struct lxc_conf *conf);
-__hidden extern int lxc_rootfs_prepare(struct lxc_rootfs *rootfs, bool userns);
+__hidden extern int lxc_storage_prepare(struct lxc_conf *conf);
+__hidden extern int lxc_rootfs_prepare(struct lxc_conf *conf, bool userns);
+__hidden extern void lxc_storage_put(struct lxc_conf *conf);
+__hidden extern int lxc_rootfs_init(struct lxc_conf *conf, bool userns);
+__hidden extern int lxc_rootfs_prepare_parent(struct lxc_handler *handler);
+__hidden extern int lxc_idmapped_mounts_parent(struct lxc_handler *handler);
 __hidden extern int lxc_map_ids(struct lxc_list *idmap, pid_t pid);
 __hidden extern int lxc_create_tty(const char *name, struct lxc_conf *conf);
 __hidden extern void lxc_delete_tty(struct lxc_tty_info *ttys);
@@ -528,9 +543,9 @@ __hidden extern int userns_exec_1(const struct lxc_conf *conf, int (*fn)(void *)
 				  const char *fn_name);
 __hidden extern int userns_exec_full(struct lxc_conf *conf, int (*fn)(void *), void *data,
 				     const char *fn_name);
-__hidden extern int parse_mntopts(const char *mntopts, unsigned long *mntflags, char **mntdata);
+__hidden extern int parse_mntopts_legacy(const char *mntopts, unsigned long *mntflags, char **mntdata);
 __hidden extern int parse_propagationopts(const char *mntopts, unsigned long *pflags);
-__hidden extern int parse_lxc_mntopts(struct lxc_mount_options *opts, char *mnt_opts);
+__hidden extern int parse_lxc_mount_attrs(struct lxc_mount_options *opts, char *mnt_opts);
 __hidden extern void tmp_proc_unmount(struct lxc_conf *lxc_conf);
 __hidden extern void suggest_default_idmap(void);
 __hidden extern FILE *make_anonymous_mount_file(struct lxc_list *mount, bool include_nesting_helpers);
@@ -567,7 +582,8 @@ static inline int chown_mapped_root(const char *path, const struct lxc_conf *con
 	return userns_exec_mapped_root(path, -EBADF, conf);
 }
 
-__hidden int lxc_setup_devpts_parent(struct lxc_handler *handler);
+__hidden extern int lxc_sync_fds_parent(struct lxc_handler *handler);
+__hidden extern int lxc_sync_fds_child(struct lxc_handler *handler);
 
 static inline const char *get_rootfs_mnt(const struct lxc_rootfs *rootfs)
 {
@@ -576,9 +592,17 @@ static inline const char *get_rootfs_mnt(const struct lxc_rootfs *rootfs)
 	return !is_empty_string(rootfs->path) ? rootfs->mount : s;
 }
 
-static inline bool idmapped_rootfs_mnt(const struct lxc_rootfs *rootfs)
+static inline void put_lxc_mount_options(struct lxc_mount_options *mnt_opts)
 {
-	return rootfs->mnt_opts.userns_fd >= 0;
+	mnt_opts->create_dir = 0;
+	mnt_opts->create_file = 0;
+	mnt_opts->optional = 0;
+	mnt_opts->relative = 0;
+	mnt_opts->userns_path[0] = '\0';
+	mnt_opts->mnt_flags = 0;
+	mnt_opts->prop_flags = 0;
+
+	free_disarm(mnt_opts->data);
 }
 
 static inline void put_lxc_rootfs(struct lxc_rootfs *rootfs, bool unpin)
@@ -587,9 +611,12 @@ static inline void put_lxc_rootfs(struct lxc_rootfs *rootfs, bool unpin)
 		close_prot_errno_disarm(rootfs->dfd_host);
 		close_prot_errno_disarm(rootfs->dfd_mnt);
 		close_prot_errno_disarm(rootfs->dfd_dev);
-		close_prot_errno_disarm(rootfs->mnt_opts.userns_fd);
 		if (unpin)
 			close_prot_errno_disarm(rootfs->fd_path_pin);
+		close_prot_errno_disarm(rootfs->dfd_idmapped);
+		put_lxc_mount_options(&rootfs->mnt_opts);
+		storage_put(rootfs->storage);
+		rootfs->storage = NULL;
 	}
 }
 
@@ -604,6 +631,14 @@ static inline void lxc_clear_cgroup2_devices(struct bpf_devices *bpf_devices)
 	}
 
 	lxc_list_init(&bpf_devices->device_item);
+}
+
+static inline int lxc_personality(personality_t persona)
+{
+	if (persona < 0)
+		return ret_errno(EINVAL);
+
+	return personality(persona);
 }
 
 #endif /* __LXC_CONF_H */

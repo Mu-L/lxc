@@ -280,6 +280,7 @@ __hidden extern struct cgroup_ops *cgroup_init(struct lxc_conf *conf);
 
 __hidden extern void cgroup_exit(struct cgroup_ops *ops);
 define_cleanup_function(struct cgroup_ops *, cgroup_exit);
+#define __cleanup_cgroup_ops call_cleaner(cgroup_exit)
 
 __hidden extern int cgroup_attach(const struct lxc_conf *conf, const char *name,
 				  const char *lxcpath, pid_t pid);
@@ -324,6 +325,9 @@ static inline int prepare_cgroup_ctx(struct cgroup_ops *ops,
 				     struct cgroup_ctx *ctx)
 {
 	__u32 idx;
+
+	if (!ops || !ops->hierarchies)
+		return ret_errno(ENOENT);
 
 	for (idx = 0; ops->hierarchies[idx]; idx++) {
 		if (idx >= CGROUP_CTX_MAX_FD)

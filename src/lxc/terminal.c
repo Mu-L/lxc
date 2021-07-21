@@ -251,7 +251,7 @@ static int lxc_terminal_write_log_file(struct lxc_terminal *terminal, char *buf,
 		/* This isn't a regular file. so rotating the file seems a
 		 * dangerous thing to do, size limits are also very
 		 * questionable. Let's not risk anything and tell the user that
-		 * he's requesting us to do weird stuff.
+		 * they're requesting us to do weird stuff.
 		 */
 		if (terminal->log_rotate > 0 || terminal->log_size > 0)
 			return -EINVAL;
@@ -474,7 +474,7 @@ int lxc_setup_tios(int fd, struct termios *oldtios)
 #ifdef IEXTEN
 	newtios.c_lflag &= ~IEXTEN;
 #endif
-	newtios.c_oflag &= ~ONLCR;
+	newtios.c_oflag |= ONLCR;
 	newtios.c_oflag |= OPOST;
 	newtios.c_cc[VMIN] = 1;
 	newtios.c_cc[VTIME] = 0;
@@ -920,8 +920,12 @@ static int lxc_terminal_create_native(const char *name, const char *lxcpath, str
 		return log_error_errno(-1, errno, "Failed to receive devpts fd");
 
 	terminal->ptx = open_beneath(devpts_fd, "ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
-	if (terminal->ptx < 0)
-		return log_error_errno(-1, errno, "Failed to open terminal multiplexer device");
+	if (terminal->ptx < 0) {
+		if (errno == ENOSPC)
+			return systrace("Exceeded number of allocatable terminals");
+
+		return syserror("Failed to open terminal multiplexer device");
+	}
 
 	ret = unlockpt(terminal->ptx);
 	if (ret < 0) {
@@ -931,7 +935,17 @@ static int lxc_terminal_create_native(const char *name, const char *lxcpath, str
 
 	terminal->pty = ioctl(terminal->ptx, TIOCGPTPEER, O_RDWR | O_NOCTTY | O_CLOEXEC);
 	if (terminal->pty < 0) {
-		SYSWARN("Failed to allocate new pty device");
+		switch (errno) {
+		case ENOTTY:
+			SYSTRACE("Pure fd-based terminal allocation not possible");
+			break;
+		case ENOSPC:
+			SYSTRACE("Exceeded number of allocatable terminals");
+			break;
+		default:
+			SYSWARN("Failed to allocate new pty device");
+			break;
+		}
 		goto err;
 	}
 

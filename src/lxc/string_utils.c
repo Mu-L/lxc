@@ -404,6 +404,9 @@ char **lxc_string_split_quoted(char *string)
 	if (state == 'a')
 		complete_word(&result, nextword, p, &result_capacity, &result_count);
 
+	if (result == NULL)
+		return calloc(1, sizeof(char *));
+
 	return realloc(result, (result_count + 1) * sizeof(char *));
 }
 
@@ -442,6 +445,9 @@ char **lxc_string_split_and_trim(const char *string, char _sep)
 
 		result_count++;
 	}
+
+	if (result == NULL)
+		return calloc(1, sizeof(char *));
 
 	/* if we allocated too much, reduce it */
 	return realloc(result, (result_count + 1) * sizeof(char *));
@@ -877,14 +883,18 @@ int parse_byte_size_string(const char *s, long long int *converted)
 	char *end;
 	char dup[INTTYPE_TO_STRLEN(long long int)] = {0};
 	char suffix[3] = {0};
+	size_t len;
 
-	if (is_empty_string(s))
+	if (!s)
 		return ret_errno(EINVAL);
 
-	end = stpncpy(dup, s, sizeof(dup) - 1);
-	if (*end != '\0')
+	len = strlen(s);
+	if (len == 0 || len > sizeof(dup) - 1)
 		return ret_errno(EINVAL);
 
+	memcpy(dup, s, len);
+
+	end = dup + len;
 	if (isdigit(*(end - 1)))
 		suffix_len = 0;
 	else if (isalpha(*(end - 1)))

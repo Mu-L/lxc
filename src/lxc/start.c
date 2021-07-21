@@ -212,6 +212,31 @@ static bool match_dlog_fds(struct dirent *direntp)
 }
 #endif
 
+/* Parses the LISTEN_FDS environment variable value.
+ * The returned value is the highest fd number up to which the
+ * file descriptors must be passed to the container process.
+ *
+ * For example, if LISTEN_FDS=2 then 4 is returned and file descriptors 3 and 4
+ * MUST be passed to the container process (in addition to the standard streams)
+ * to support [socket activation][systemd-listen-fds].
+ */
+static unsigned int get_listen_fds_max(void)
+{
+	int ret;
+	unsigned int num_fds;
+	const char *val;
+
+	val = getenv("LISTEN_FDS");
+	if (!val)
+		return 0;
+
+	ret = lxc_safe_uint(val, &num_fds);
+	if (ret < 0)
+		return syserror_ret(0, "Failed to parse \"LISTEN_FDS=%s\" environment variable", val);
+
+	return log_trace(num_fds, "Parsed \"LISTEN_FDS=%s\" environment variable", val);
+}
+
 int lxc_check_inherited(struct lxc_conf *conf, bool closeall,
 			int *fds_to_ignore, size_t len_fds)
 {
@@ -219,9 +244,12 @@ int lxc_check_inherited(struct lxc_conf *conf, bool closeall,
 	size_t i;
 	DIR *dir;
 	struct dirent *direntp;
+	unsigned int listen_fds_max;
 
 	if (conf && conf->close_all_fds)
 		closeall = true;
+
+	listen_fds_max = get_listen_fds_max();
 
 	/*
 	 * Disable syslog at this point to avoid the above logging
@@ -289,6 +317,12 @@ restart:
 			continue;
 
 #endif
+
+		if (fd <= listen_fds_max) {
+			INFO("Inheriting fd %d (using the LISTEN_FDS environment variable)", fd);
+			continue;
+		}
+
 		if (closeall) {
 			if (close(fd))
 				SYSINFO("Closed inherited fd %d", fd);
@@ -1042,7 +1076,7 @@ static int do_start(void *data)
 	lxc_sync_fini_parent(handler);
 
 	if (lxc_abstract_unix_recv_one_fd(data_sock1, &status_fd, NULL, 0) < 0) {
-		ERROR("Failed to receive status file descriptor to child process");
+		ERROR("Failed to receive status file descriptor from parent process");
 		goto out_warn_father;
 	}
 
@@ -1083,20 +1117,6 @@ static int do_start(void *data)
 			goto out_warn_father;
 		}
 		INFO("Unshared CLONE_NEWNET");
-	}
-
-	/* Tell the parent task it can begin to configure the container and wait
-	 * for it to finish.
-	 */
-	if (!lxc_sync_barrier_parent(handler, START_SYNC_CONFIGURE))
-		goto out_error;
-
-	if (handler->ns_clone_flags & CLONE_NEWNET) {
-		ret = lxc_network_recv_from_parent(handler);
-		if (ret < 0) {
-			ERROR("Failed to receive veth names from parent");
-			goto out_warn_father;
-		}
 	}
 
 	/* If we are in a new user namespace, become root there to have
@@ -1166,8 +1186,11 @@ static int do_start(void *data)
 		}
 	}
 
-	/* Ask father to setup cgroups and wait for him to finish. */
-	if (!lxc_sync_barrier_parent(handler, START_SYNC_CGROUP))
+	/*
+	 * Tell the parent task it can begin to configure the container and wait
+	 * for it to finish.
+	 */
+	if (!lxc_sync_wake_parent(handler, START_SYNC_CONFIGURE))
 		goto out_error;
 
 	/* Unshare cgroup namespace after we have setup our cgroups. If we do it
@@ -1259,6 +1282,9 @@ static int do_start(void *data)
 		}
 	}
 
+	if (!lxc_sync_wait_parent(handler, START_SYNC_POST_CONFIGURE))
+		goto out_warn_father;
+
 	/* Setup the container, ip, names, utsname, ... */
 	ret = lxc_setup(handler);
 	if (ret < 0) {
@@ -1290,12 +1316,6 @@ static int do_start(void *data)
 	ret = lxc_seccomp_load(handler->conf);
 	if (ret < 0)
 		goto out_warn_father;
-
-	ret = lxc_seccomp_send_notifier_fd(&handler->conf->seccomp, data_sock0);
-	if (ret < 0) {
-		SYSERROR("Failed to send seccomp notify fd to parent");
-		goto out_warn_father;
-	}
 
 	ret = run_lxc_hooks(handler->name, "start", handler->conf, NULL);
 	if (ret < 0) {
@@ -1334,6 +1354,15 @@ static int do_start(void *data)
 	}
 
 	if (!lxc_sync_barrier_parent(handler, START_SYNC_CGROUP_LIMITS))
+		goto out_warn_father;
+
+	ret = lxc_sync_fds_child(handler);
+	if (ret < 0) {
+		SYSERROR("Failed to sync file descriptors with parent");
+		goto out_warn_father;
+	}
+
+	if (!lxc_sync_wait_parent(handler, START_SYNC_READY_START))
 		goto out_warn_father;
 
 	/* Reset the environment variables the user requested in a clear
@@ -1441,44 +1470,6 @@ out_error:
 	return -1;
 }
 
-static int lxc_recv_ttys_from_child(struct lxc_handler *handler)
-{
-	int i;
-	struct lxc_terminal_info *tty;
-	int ret = -1;
-	int sock = handler->data_sock[1];
-	struct lxc_conf *conf = handler->conf;
-	struct lxc_tty_info *ttys = &conf->ttys;
-
-	if (!conf->ttys.max)
-		return 0;
-
-	ttys->tty = malloc(sizeof(*ttys->tty) * ttys->max);
-	if (!ttys->tty)
-		return -1;
-
-	for (i = 0; i < conf->ttys.max; i++) {
-		int ttyfds[2];
-
-		ret = lxc_abstract_unix_recv_two_fds(sock, ttyfds);
-		if (ret < 0)
-			break;
-
-		tty = &ttys->tty[i];
-		tty->busy = -1;
-		tty->ptx = ttyfds[0];
-		tty->pty = ttyfds[1];
-		TRACE("Received pty with ptx fd %d and pty fd %d from child", tty->ptx, tty->pty);
-	}
-
-	if (ret < 0)
-		SYSERROR("Failed to receive %zu ttys from child", ttys->max);
-	else
-		TRACE("Received %zu ttys from child", ttys->max);
-
-	return ret;
-}
-
 int resolve_clone_flags(struct lxc_handler *handler)
 {
 	int i;
@@ -1546,9 +1537,9 @@ int resolve_clone_flags(struct lxc_handler *handler)
  * newer glibc versions where the getpid() cache is removed and the pid/tid is
  * not reset anymore.
  * However, if for whatever reason you - dear committer - somehow need to get the
- * pid of the dummy intermediate process for do_share_ns() you need to call
- * lxc_raw_getpid(). The next lxc_raw_clone() call does not employ CLONE_VM and
- * will be fine.
+ * pid of the placeholder intermediate process for do_share_ns() you need to
+ * call lxc_raw_getpid(). The next lxc_raw_clone() call does not employ
+ * CLONE_VM and will be fine.
  */
 static inline int do_share_ns(void *arg)
 {
@@ -1786,12 +1777,6 @@ static int lxc_spawn(struct lxc_handler *handler)
 		}
 	}
 
-	if (!lxc_sync_wake_child(handler, START_SYNC_STARTUP))
-		goto out_delete_net;
-
-	if (!lxc_sync_wait_child(handler, START_SYNC_CONFIGURE))
-		goto out_delete_net;
-
 	if (!cgroup_ops->setup_limits_legacy(cgroup_ops, handler->conf, false)) {
 		ERROR("Failed to setup cgroup limits for container \"%s\"", name);
 		goto out_delete_net;
@@ -1813,6 +1798,9 @@ static int lxc_spawn(struct lxc_handler *handler)
 	}
 
 	if (!cgroup_ops->chown(cgroup_ops, handler->conf))
+		goto out_delete_net;
+
+	if (!lxc_sync_barrier_child(handler, START_SYNC_STARTUP))
 		goto out_delete_net;
 
 	/* If not done yet, we're now ready to preserve the network namespace */
@@ -1838,12 +1826,6 @@ static int lxc_spawn(struct lxc_handler *handler)
 			ERROR("Failed to create the network");
 			goto out_delete_net;
 		}
-
-		ret = lxc_network_send_to_child(handler);
-		if (ret < 0) {
-			ERROR("Failed to send veth names to child");
-			goto out_delete_net;
-		}
 	}
 
 	if (!lxc_list_empty(&conf->procs)) {
@@ -1851,12 +1833,6 @@ static int lxc_spawn(struct lxc_handler *handler)
 		if (ret < 0)
 			goto out_delete_net;
 	}
-
-	/* Tell the child to continue its initialization. We'll get
-	 * START_SYNC_CGROUP when it is ready for us to setup cgroups.
-	 */
-	if (!lxc_sync_barrier_child(handler, START_SYNC_POST_CONFIGURE))
-		goto out_delete_net;
 
 	if (!lxc_list_empty(&conf->limits)) {
 		ret = setup_resource_limits(&conf->limits, handler->pid);
@@ -1866,7 +1842,34 @@ static int lxc_spawn(struct lxc_handler *handler)
 		}
 	}
 
-	if (!lxc_sync_barrier_child(handler, START_SYNC_CGROUP_UNSHARE))
+	/* Tell the child to continue its initialization. */
+	if (!lxc_sync_wake_child(handler, START_SYNC_POST_CONFIGURE))
+		goto out_delete_net;
+
+	ret = lxc_rootfs_prepare_parent(handler);
+	if (ret) {
+		ERROR("Failed to prepare rootfs");
+		goto out_delete_net;
+	}
+
+	if (handler->ns_clone_flags & CLONE_NEWNET) {
+		ret = lxc_network_send_to_child(handler);
+		if (ret < 0) {
+			SYSERROR("Failed to send veth names to child");
+			goto out_delete_net;
+		}
+	}
+
+	if (!lxc_sync_wait_child(handler, START_SYNC_IDMAPPED_MOUNTS))
+		goto out_delete_net;
+
+	ret = lxc_idmapped_mounts_parent(handler);
+	if (ret) {
+		ERROR("Failed to setup mount entries");
+		goto out_delete_net;
+	}
+
+	if (!lxc_sync_wait_child(handler, START_SYNC_CGROUP_LIMITS))
 		goto out_delete_net;
 
 	/*
@@ -1886,6 +1889,19 @@ static int lxc_spawn(struct lxc_handler *handler)
 	}
 	TRACE("Set up cgroup2 device controller limits");
 
+	cgroup_ops->finalize(cgroup_ops);
+	TRACE("Finished setting up cgroups");
+
+	/* Run any host-side start hooks */
+	ret = run_lxc_hooks(name, "start-host", conf, NULL);
+	if (ret < 0) {
+		ERROR("Failed to run lxc.hook.start-host");
+		goto out_delete_net;
+	}
+
+	if (!lxc_sync_wake_child(handler, START_SYNC_FDS))
+		goto out_delete_net;
+
 	if (handler->ns_unshare_flags & CLONE_NEWCGROUP) {
 		/* Now we're ready to preserve the cgroup namespace */
 		ret = lxc_try_preserve_namespace(handler, LXC_NS_CGROUP, "cgroup");
@@ -1896,9 +1912,6 @@ static int lxc_spawn(struct lxc_handler *handler)
 			}
 		}
 	}
-
-	cgroup_ops->finalize(cgroup_ops);
-	TRACE("Finished setting up cgroups");
 
 	if (handler->ns_unshare_flags & CLONE_NEWTIME) {
 		/* Now we're ready to preserve the time namespace */
@@ -1911,35 +1924,21 @@ static int lxc_spawn(struct lxc_handler *handler)
 		}
 	}
 
-	/* Run any host-side start hooks */
-	ret = run_lxc_hooks(name, "start-host", conf, NULL);
+	ret = lxc_sync_fds_parent(handler);
 	if (ret < 0) {
-		ERROR("Failed to run lxc.hook.start-host");
+		SYSERROR("Failed to sync file descriptors with child");
 		goto out_delete_net;
 	}
 
-	/* Tell the child to complete its initialization and wait for it to exec
-	 * or return an error. (The child will never return
-	 * START_SYNC_READY_START+1. It will either close the sync pipe, causing
-	 * lxc_sync_barrier_child to return success, or return a different
-	 * value, causing us to error out).
+	/*
+	 * Tell the child to complete its initialization and wait for it to
+	 * exec or return an error. (The child will never return
+	 * START_SYNC_READY_START+1. It will either close the sync pipe,
+	 * causing lxc_sync_barrier_child to return success, or return a
+	 * different value, causing us to error out).
 	 */
 	if (!lxc_sync_barrier_child(handler, START_SYNC_READY_START))
 		goto out_delete_net;
-
-	if (handler->ns_clone_flags & CLONE_NEWNET) {
-		ret = lxc_network_recv_name_and_ifindex_from_child(handler);
-		if (ret < 0) {
-			ERROR("Failed to receive names and ifindices for network devices from child");
-			goto out_delete_net;
-		}
-	}
-
-	ret = lxc_setup_devpts_parent(handler);
-	if (ret < 0) {
-		SYSERROR("Failed to receive devpts fd from child");
-		goto out_delete_net;
-	}
 
 	/* Now all networks are created, network devices are moved into place,
 	 * and the correct names and ifindices in the respective namespaces have
@@ -1947,19 +1946,6 @@ static int lxc_spawn(struct lxc_handler *handler)
 	 * log them for debugging purposes.
 	 */
 	lxc_log_configured_netdevs(conf);
-
-	/* Read tty fds allocated by child. */
-	ret = lxc_recv_ttys_from_child(handler);
-	if (ret < 0) {
-		ERROR("Failed to receive tty info from child process");
-		goto out_delete_net;
-	}
-
-	ret = lxc_seccomp_recv_notifier_fd(&handler->conf->seccomp, data_sock1);
-	if (ret < 0) {
-		SYSERROR("Failed to receive seccomp notify fd from child");
-		goto out_delete_net;
-	}
 
 	ret = handler->ops->post_start(handler, handler->data);
 	if (ret < 0)
@@ -2034,7 +2020,7 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
 	 * it readonly.
 	 * If the container is unprivileged then skip rootfs pinning.
 	 */
-	ret = lxc_rootfs_prepare(&conf->rootfs, !lxc_list_empty(&conf->id_map));
+	ret = lxc_rootfs_init(conf, !lxc_list_empty(&conf->id_map));
 	if (ret) {
 		ERROR("Failed to handle rootfs pinning for container \"%s\"", handler->name);
 		ret = -1;
@@ -2043,21 +2029,9 @@ int __lxc_start(struct lxc_handler *handler, struct lxc_operations *ops,
 
 	if (geteuid() == 0 && !lxc_list_empty(&conf->id_map)) {
 		/*
-		 * This handles two cases: mounting real block devices and
-		 * creating idmapped mounts. The block device case should be
-		 * obivous, i.e. no real filesystem can currently be mounted
-		 * from inside a user namespace.
-		 *
-		 * Idmapped mounts can currently only be created if the caller
-		 * is privileged wrt to the user namespace in which the
-		 * underlying block device has been mounted in. This basically
-		 * (with few exceptions) means we need to be CAP_SYS_ADMIN in
-		 * the initial user namespace since almost no interesting
-		 * filesystems can be mounted inside of user namespaces. This
-		 * is way we need to do the rootfs setup here. In the future
-		 * this may change.
+		 * Most filesystems can't be mounted inside a userns so handle them here.
 		 */
-		if (idmapped_rootfs_mnt(&conf->rootfs) || rootfs_is_blockdev(conf)) {
+		if (rootfs_is_blockdev(conf)) {
 			ret = unshare(CLONE_NEWNS);
 			if (ret < 0) {
 				ERROR("Failed to unshare CLONE_NEWNS");

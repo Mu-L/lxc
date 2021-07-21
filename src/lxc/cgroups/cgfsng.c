@@ -779,7 +779,6 @@ static bool cgroup_tree_create(struct cgroup_ops *ops, struct lxc_conf *conf,
 			       const char *cgroup_leaf, bool payload)
 {
 	__do_close int fd_limit = -EBADF, fd_final = -EBADF;
-	__do_free char *path = NULL, *limit_path = NULL;
 	bool cpuset_v1 = false;
 
 	/*
@@ -794,8 +793,11 @@ static bool cgroup_tree_create(struct cgroup_ops *ops, struct lxc_conf *conf,
 		if (fd_limit < 0)
 			return syserror_ret(false, "Failed to create limiting cgroup %d(%s)", h->dfd_base, cgroup_limit_dir);
 
+		h->path_lim = make_cgroup_path(h, h->at_base, cgroup_limit_dir, NULL);
+		h->dfd_lim = move_fd(fd_limit);
+
 		TRACE("Created limit cgroup %d->%d(%s)",
-		      fd_limit, h->dfd_base, cgroup_limit_dir);
+		      h->dfd_lim, h->dfd_base, cgroup_limit_dir);
 
 		/*
 		 * With isolation the devices legacy cgroup needs to be
@@ -807,44 +809,36 @@ static bool cgroup_tree_create(struct cgroup_ops *ops, struct lxc_conf *conf,
 		    !ops->setup_limits_legacy(ops, conf, true))
 			return log_error(false, "Failed to setup legacy device limits");
 
-		limit_path = make_cgroup_path(h, h->at_base, cgroup_limit_dir, NULL);
-		path = must_make_path(limit_path, cgroup_leaf, NULL);
-
 		/*
 		 * If we use a separate limit cgroup, the leaf cgroup, i.e. the
 		 * cgroup the container actually resides in, is below fd_limit.
 		 */
-		fd_final = __cgroup_tree_create(fd_limit, cgroup_leaf, 0755, cpuset_v1, false);
+		fd_final = __cgroup_tree_create(h->dfd_lim, cgroup_leaf, 0755, cpuset_v1, false);
 		if (fd_final < 0) {
 			/* Ensure we don't leave any garbage behind. */
 			if (cgroup_tree_prune(h->dfd_base, cgroup_limit_dir))
 				SYSWARN("Failed to destroy %d(%s)", h->dfd_base, cgroup_limit_dir);
 			else
 				TRACE("Removed cgroup tree %d(%s)", h->dfd_base, cgroup_limit_dir);
+			return syserror_ret(false, "Failed to create %s cgroup %d(%s)", payload ? "payload" : "monitor", h->dfd_base, cgroup_limit_dir);
 		}
-	} else {
-		path = make_cgroup_path(h, h->at_base, cgroup_limit_dir, NULL);
-
-		fd_final = __cgroup_tree_create(h->dfd_base, cgroup_limit_dir, 0755, cpuset_v1, false);
-	}
-	if (fd_final < 0)
-		return syserror_ret(false, "Failed to create %s cgroup %d(%s)", payload ? "payload" : "monitor", h->dfd_base, cgroup_limit_dir);
-
-	if (payload) {
 		h->dfd_con = move_fd(fd_final);
-		h->path_con = move_ptr(path);
+		h->path_con = must_make_path(h->path_lim, cgroup_leaf, NULL);
 
-		if (fd_limit < 0)
-			h->dfd_lim = h->dfd_con;
-		else
-			h->dfd_lim = move_fd(fd_limit);
-
-		if (limit_path)
-			h->path_lim = move_ptr(limit_path);
-		else
-			h->path_lim = h->path_con;
 	} else {
-		h->dfd_mon = move_fd(fd_final);
+		fd_final = __cgroup_tree_create(h->dfd_base, cgroup_limit_dir, 0755, cpuset_v1, false);
+		if (fd_final < 0)
+			return syserror_ret(false, "Failed to create %s cgroup %d(%s)", payload ? "payload" : "monitor", h->dfd_base, cgroup_limit_dir);
+
+		if (payload) {
+			h->dfd_con = move_fd(fd_final);
+			h->dfd_lim = h->dfd_con;
+			h->path_con = make_cgroup_path(h, h->at_base, cgroup_limit_dir, NULL);
+
+			h->path_lim = h->path_con;
+		} else {
+			h->dfd_mon = move_fd(fd_final);
+		}
 	}
 
 	return true;
@@ -1910,7 +1904,7 @@ __cgfsng_ops static bool cgfsng_criu_get_hierarchies(struct cgroup_ops *ops,
 	if (!ops->hierarchies)
 		return ret_set_errno(false, ENOENT);
 
-	/* sanity check n */
+	/* consistency check n */
 	for (i = 0; i < n; i++)
 		if (!ops->hierarchies[i])
 			return ret_set_errno(false, ENOENT);
@@ -2211,16 +2205,13 @@ static int cgroup_attach_move_into_leaf(const struct lxc_conf *conf,
 					int *sk_fd, pid_t pid)
 {
 	__do_close int sk = *sk_fd, target_fd0 = -EBADF, target_fd1 = -EBADF;
-	int target_fds[2];
 	char pidstr[INTTYPE_TO_STRLEN(int64_t) + 1];
 	size_t pidstr_len;
 	ssize_t ret;
 
-	ret = lxc_abstract_unix_recv_two_fds(sk, target_fds);
+	ret = lxc_abstract_unix_recv_two_fds(sk, &target_fd0, &target_fd1);
 	if (ret < 0)
 		return log_error_errno(-1, errno, "Failed to receive target cgroup fd");
-	target_fd0 = target_fds[0];
-	target_fd1 = target_fds[1];
 
 	pidstr_len = sprintf(pidstr, INT64_FMT, (int64_t)pid);
 
@@ -2293,7 +2284,7 @@ static int __cg_unified_attach(const struct hierarchy *h,
 	ret = cgroup_attach(conf, name, lxcpath, pid);
 	if (ret == 0)
 		return log_trace(0, "Attached to unified cgroup via command handler");
-	if (ret != -ENOCGROUP2)
+	if (!ERRNO_IS_NOT_SUPPORTED(ret) && ret != -ENOCGROUP2)
 		return log_error_errno(ret, errno, "Failed to attach to unified cgroup");
 
 	/* Fall back to retrieving the path for the unified cgroup. */
@@ -3080,10 +3071,62 @@ static bool unified_hierarchy_delegated(int dfd_base, char ***ret_files)
 
 static bool legacy_hierarchy_delegated(int dfd_base)
 {
-	if (faccessat(dfd_base, "cgroup.procs", W_OK, 0) && errno != ENOENT)
-		return sysinfo_ret(false, "The cgroup.procs file is not writable, skipping legacy hierarchy");
+	int ret;
+
+	ret = faccessat(dfd_base, ".", W_OK, 0);
+	if (ret < 0 && errno != ENOENT)
+		return sysinfo_ret(false, "Legacy hierarchy not writable, skipping");
 
 	return true;
+}
+
+/**
+ * systemd guarantees that the order of co-mounted controllers is stable. On
+ * some systems the order of the controllers might be reversed though.
+ *
+ * For example, this is how the order is mismatched on CentOS 7:
+ *
+ *      [root@localhost ~]# cat /proc/self/cgroup
+ *      11:perf_event:/
+ *      10:pids:/
+ *      9:freezer:/
+ * >>>> 8:cpuacct,cpu:/
+ *      7:memory:/
+ *      6:blkio:/
+ *      5:devices:/
+ *      4:hugetlb:/
+ * >>>> 3:net_prio,net_cls:/
+ *      2:cpuset:/
+ *      1:name=systemd:/user.slice/user-0.slice/session-c1.scope
+ *
+ * whereas the mountpoint:
+ *
+ *      | |-/sys/fs/cgroup                    tmpfs         tmpfs      ro,nosuid,nodev,noexec,mode=755
+ *      | | |-/sys/fs/cgroup/systemd          cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd
+ *      | | |-/sys/fs/cgroup/cpuset           cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,cpuset
+ * >>>> | | |-/sys/fs/cgroup/net_cls,net_prio cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,net_prio,net_cls
+ *      | | |-/sys/fs/cgroup/hugetlb          cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,hugetlb
+ *      | | |-/sys/fs/cgroup/devices          cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,devices
+ *      | | |-/sys/fs/cgroup/blkio            cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,blkio
+ *      | | |-/sys/fs/cgroup/memory           cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,memory
+ * >>>> | | |-/sys/fs/cgroup/cpu,cpuacct      cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,cpuacct,cpu
+ *      | | |-/sys/fs/cgroup/freezer          cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,freezer
+ *      | | |-/sys/fs/cgroup/pids             cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,pids
+ *      | | `-/sys/fs/cgroup/perf_event       cgroup        cgroup     rw,nosuid,nodev,noexec,relatime,perf_event
+ *
+ * Ensure that we always use the systemd-guaranteed stable order when checking
+ * for the mountpoint.
+ */
+__attribute__((returns_nonnull)) __attribute__((nonnull))
+static const char *stable_order(const char *controllers)
+{
+	if (strequal(controllers, "cpuacct,cpu"))
+		return "cpu,cpuacct";
+
+	if (strequal(controllers, "net_prio,net_cls"))
+		return "net_cls,net_prio";
+
+	return unprefix(controllers);
 }
 
 static int __initialize_cgroups(struct cgroup_ops *ops, bool relative,
@@ -3145,8 +3188,15 @@ static int __initialize_cgroups(struct cgroup_ops *ops, bool relative,
 				dfd_base = open_at(dfd_mnt, current_cgroup,
 						   PROTECT_OPATH_DIRECTORY,
 						   PROTECT_LOOKUP_BENEATH_XDEV, 0);
-				if (dfd_base < 0)
-					return syserror("Failed to open %d/%s", dfd_mnt, current_cgroup);
+				if (dfd_base < 0) {
+					if (errno != ENOENT)
+						return syserror("Failed to open %d/%s",
+								dfd_mnt, current_cgroup);
+
+					SYSTRACE("Current cgroup %d/%s does not exist (funky cgroup layout?)",
+						 dfd_mnt, current_cgroup);
+					continue;
+				}
 				dfd = dfd_base;
 			}
 
@@ -3180,12 +3230,13 @@ static int __initialize_cgroups(struct cgroup_ops *ops, bool relative,
 			*__current_cgroup = '\0';
 			__current_cgroup++;
 
-			controllers = strdup(unprefix(__controllers));
+			controllers = strdup(stable_order(__controllers));
 			if (!controllers)
 				return ret_errno(ENOMEM);
 
 			dfd_mnt = open_at(ops->dfd_mnt,
-					  controllers, PROTECT_OPATH_DIRECTORY,
+					  controllers,
+					  PROTECT_OPATH_DIRECTORY,
 					  PROTECT_LOOKUP_ABSOLUTE_XDEV, 0);
 			if (dfd_mnt < 0) {
 				if (errno != ENOENT)
@@ -3215,9 +3266,15 @@ static int __initialize_cgroups(struct cgroup_ops *ops, bool relative,
 				dfd_base = open_at(dfd_mnt, current_cgroup,
 						   PROTECT_OPATH_DIRECTORY,
 						   PROTECT_LOOKUP_BENEATH_XDEV, 0);
-				if (dfd_base < 0)
-					return syserror("Failed to open %d/%s",
-							dfd_mnt, current_cgroup);
+				if (dfd_base < 0) {
+					if (errno != ENOENT)
+						return syserror("Failed to open %d/%s",
+								dfd_mnt, current_cgroup);
+
+					SYSTRACE("Current cgroup %d/%s does not exist (funky cgroup layout?)",
+						 dfd_mnt, current_cgroup);
+					continue;
+				}
 				dfd = dfd_base;
 			}
 
@@ -3342,14 +3399,14 @@ __cgfsng_ops static int cgfsng_data_init(struct cgroup_ops *ops)
 
 struct cgroup_ops *cgroup_ops_init(struct lxc_conf *conf)
 {
-	__do_free struct cgroup_ops *cgfsng_ops = NULL;
+	__cleanup_cgroup_ops struct cgroup_ops *cgfsng_ops = NULL;
 
 	cgfsng_ops = zalloc(sizeof(struct cgroup_ops));
 	if (!cgfsng_ops)
 		return ret_set_errno(NULL, ENOMEM);
 
-	cgfsng_ops->cgroup_layout = CGROUP_LAYOUT_UNKNOWN;
-	cgfsng_ops->dfd_mnt = -EBADF;
+	cgfsng_ops->cgroup_layout	= CGROUP_LAYOUT_UNKNOWN;
+	cgfsng_ops->dfd_mnt		= -EBADF;
 
 	if (initialize_cgroups(cgfsng_ops, conf))
 		return NULL;
